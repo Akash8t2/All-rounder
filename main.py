@@ -960,7 +960,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • <b>Bot:</b> @{html.escape(site_data.get('bot_username', 'N/A'))}
 • <b>Chat IDs:</b> {len(site_data['chat_ids'])}
 • <b>Type:</b> {site_data['ajax_type']}
-• <b>Cookies:</b> {len(site_data.get('cookies', {}))} key(s)}"""
+• <b>Cookies:</b> {len(site_data.get('cookies', {}))} key(s)"""
             
             await update.message.reply_text(
                 success_text,
