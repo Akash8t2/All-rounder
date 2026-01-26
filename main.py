@@ -930,31 +930,50 @@ async def poller():
 
 # ================= MAIN =================
 
-async def main():
-    """Main application"""
+def setup_handlers(application):
+    """Setup all handlers"""
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("id", my_id))
+    
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+async def main_async():
+    """Main application (async)"""
     # Create application
     app = ApplicationBuilder().token(MASTER_BOT_TOKEN).build()
     
-    # Add handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("id", my_id))
-    
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    # Setup handlers
+    setup_handlers(app)
     
     # Start poller
     asyncio.create_task(poller())
     
     # Start bot
     logging.info("Starting AK KING 👑 bot...")
+    await app.initialize()
+    await app.start()
     await app.run_polling()
 
-if __name__ == "__main__":
+def main():
+    """Main entry point"""
     # Check environment variables
     if not MASTER_BOT_TOKEN:
         print("❌ Error: MASTER_BOT_TOKEN not set!")
         print("Please set MASTER_BOT_TOKEN in environment variables")
         exit(1)
     
-    asyncio.run(main())
+    try:
+        # For Heroku, we need to handle the event loop properly
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main_async())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by user")
+    except Exception as e:
+        logging.error(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
