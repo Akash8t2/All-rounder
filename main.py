@@ -15,7 +15,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputFile,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -37,32 +36,73 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# ================= DB =================
+# ================= GLOBAL CACHE =================
+
+# ✅ FIX 1: Session cache for reuse
+SITE_SESSIONS = {}
+# ✅ FIX 4: Daily reset optimization
+LAST_RESET = None
+
+# ================= DB SETUP WITH INDEXES =================
 
 mongo = MongoClient(MONGO_URI)
 db = mongo["master_bot"]
 sites_col = db["sites"]
 users_col = db["users"]
 
-# ================= HELPERS =================
+# Create indexes for performance
+try:
+    sites_col.create_index("user_id")
+    sites_col.create_index("enabled")
+    sites_col.create_index("last_uid")
+    sites_col.create_index([("user_id", 1), ("enabled", 1)])
+    users_col.create_index("user_id", unique=True)
+    logging.info("✅ MongoDB indexes created/verified")
+except Exception as e:
+    logging.warning(f"⚠️ Could not create indexes: {e}")
+
+# ================= HELPER FUNCTIONS =================
 
 def extract_otp(text: str) -> str:
-    """Extract OTP from text"""
+    """Extract OTP from text - HARDENED VERSION"""
     if not text:
         return "N/A"
     
+    # More specific patterns to avoid phone numbers/prices
     patterns = [
-        r'\b(\d{3,8})\b',
-        r'OTP[:\s]*(\d{3,8})',
-        r'code[:\s]*(\d{3,8})',
-        r'(\d{3,8})[\s]*is your',
-        r'(\d{3,8})[\s]*code'
+        r'(?:OTP|code|verification|password|पासकोड|कोड)[^\d]{0,10}(\d{4,8})',
+        r'\b(?!\d{9,})(\d{4,8})\b',  # Avoid 9+ digit numbers
+        r'(?:is|का|की)[^\d]{0,5}(\d{4,8})',
+        r'[:\-\s]\s*(\d{4,8})\b'
     ]
     
+    # First try specific patterns
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
-            return m.group(1)
+            otp = m.group(1)
+            # Validate OTP length
+            if 4 <= len(otp) <= 8:
+                return otp
+    
+    # Fallback: look for isolated 4-8 digit numbers
+    fallback_patterns = [
+        r'\b(\d{4})\b',
+        r'\b(\d{5})\b',
+        r'\b(\d{6})\b',
+        r'\b(\d{7})\b',
+        r'\b(\d{8})\b'
+    ]
+    
+    for pattern in fallback_patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            # Filter out phone numbers (usually in sequence)
+            for match in matches:
+                # Check if this looks like part of a phone number
+                context = re.search(r'\b\d{9,}\b', text)
+                if not context:
+                    return match
     
     return "N/A"
 
@@ -97,28 +137,11 @@ def get_country_from_number(number: str) -> str:
         '62': '🇮🇩 Indonesia',
         '84': '🇻🇳 Vietnam',
         '66': '🇹🇭 Thailand',
-        '49': '🇩🇪 Germany',
         '55': '🇧🇷 Brazil',
         '34': '🇪🇸 Spain',
         '39': '🇮🇹 Italy',
         '61': '🇦🇺 Australia',
         '27': '🇿🇦 South Africa',
-        '20': '🇪🇬 Egypt',
-        '90': '🇹🇷 Turkey',
-        '98': '🇮🇷 Iran',
-        '41': '🇨🇭 Switzerland',
-        '46': '🇸🇪 Sweden',
-        '47': '🇳🇴 Norway',
-        '45': '🇩🇰 Denmark',
-        '358': '🇫🇮 Finland',
-        '31': '🇳🇱 Netherlands',
-        '32': '🇧🇪 Belgium',
-        '43': '🇦🇹 Austria',
-        '48': '🇵🇱 Poland',
-        '36': '🇭🇺 Hungary',
-        '40': '🇷🇴 Romania',
-        '421': '🇸🇰 Slovakia',
-        '420': '🇨🇿 Czech',
     }
     
     for prefix, country in prefixes.items():
@@ -128,34 +151,47 @@ def get_country_from_number(number: str) -> str:
     return "🌍 International"
 
 def format_otp_message(otp: str, number: str, message: str, date: str, site_name: str, route: str = "", service: str = "") -> str:
-    """Format OTP message"""
-    masked_number = mask_phone_number(number)
-    country = get_country_from_number(number)
+    """Format OTP message with proper HTML escaping"""
+    safe_otp = html.escape(otp)
+    safe_number = html.escape(number) if number else "N/A"
+    safe_message = html.escape(message)
+    safe_site_name = html.escape(site_name)
+    safe_service = html.escape(service) if service else safe_site_name
     
-    # Use HTML for better formatting
     result = "📩 <b>LIVE OTP RECEIVED</b>\n\n"
-    result += f"📞 <b>Number:</b> <code>{number if number else 'N/A'}</code>\n"
-    result += f"🔢 <b>OTP:</b> 🔥 <code>{otp}</code> 🔥\n"
-    
-    if service:
-        result += f"🏷 <b>Service:</b> {html.escape(service)}\n"
-    else:
-        result += f"🏷 <b>Service:</b> {html.escape(site_name)}\n"
+    result += f"📞 <b>Number:</b> <code>{safe_number}</code>\n"
+    result += f"🔢 <b>OTP:</b> 🔥 <code>{safe_otp}</code> 🔥\n"
+    result += f"🏷 <b>Service:</b> {safe_service}\n"
     
     if route and route != "Unknown":
         country_from_route = route.split("-")[0] if "-" in route else route
         result += f"🌍 <b>Country:</b> {country_from_route}\n"
     else:
+        country = get_country_from_number(number)
         result += f"🌍 <b>Country:</b> {country}\n"
     
     result += f"🕒 <b>Time:</b> {date}\n\n"
-    result += f"💬 <b>SMS:</b>\n{html.escape(message)}\n\n"
+    result += f"💬 <b>SMS:</b>\n{safe_message}\n\n"
     result += "⚡ <b>—͟͟͞͞𝗔𝗞𝗔𝗦𝗛 🥀</b>"
     
     return result
 
+def get_site_session(site):
+    """Create and return a persistent session for the site"""
+    s = requests.Session()
+    s.headers.update(site.get("headers", {
+        "User-Agent": "Mozilla/5.0",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01"
+    }))
+    s.cookies.update(site.get("cookies", {}))
+    return s
+
+# ✅ FIX 3: send_to_telegram() returns correctly for all chats
 def send_to_telegram(bot_token: str, chat_ids: List[str], text: str, owner_url: str = "", support_url: str = "t.me/botcasx"):
-    """Send message to Telegram"""
+    """Send message to Telegram - IMPROVED"""
+    success = True
+    
     for chat_id in chat_ids:
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -181,9 +217,33 @@ def send_to_telegram(bot_token: str, chat_ids: List[str], text: str, owner_url: 
             
             if response.status_code != 200:
                 logging.error(f"Failed to send to chat {chat_id}: {response.text}")
+                success = False
+                # Don't return here - try sending to other chats
         
         except Exception as e:
-            logging.error(f"Error sending to Telegram: {str(e)}")
+            logging.error(f"Error sending to Telegram for chat {chat_id}: {str(e)}")
+            success = False
+            # Continue trying other chats
+    
+    return success
+
+def reset_daily_stats():
+    """Reset daily statistics at midnight UTC"""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    
+    # Update all sites where last_day is not today
+    result = sites_col.update_many(
+        {"stats.last_day": {"$ne": today}},
+        {
+            "$set": {
+                "stats.today": 0,
+                "stats.last_day": today
+            }
+        }
+    )
+    
+    if result.modified_count > 0:
+        logging.info(f"✅ Reset daily stats for {result.modified_count} sites")
 
 # ================= SITE MANAGEMENT =================
 
@@ -207,7 +267,8 @@ def add_site(user_id: int, site_data: Dict) -> str:
             "today": 0,
             "total": 0,
             "errors": 0,
-            "last_success": None
+            "last_success": None,
+            "last_day": datetime.utcnow().strftime("%Y-%m-%d")
         },
         "cookies": site_data.get("cookies", {}),
         "headers": site_data.get("headers", {
@@ -217,7 +278,7 @@ def add_site(user_id: int, site_data: Dict) -> str:
         }),
         "owner_url": site_data.get("owner_url", ""),
         "support_url": site_data.get("support_url", "t.me/botcasx"),
-        "ajax_type": site_data.get("ajax_type", "standard")  # standard or ints_sms
+        "ajax_type": site_data.get("ajax_type", "standard")
     })
     
     sites_col.insert_one(site_data)
@@ -233,11 +294,15 @@ def get_site(site_id: str) -> Optional[Dict]:
 
 def update_site(site_id: str, update_data: Dict) -> bool:
     """Update site data"""
-    result = sites_col.update_one(
-        {"_id": site_id},
-        {"$set": update_data}
-    )
-    return result.modified_count > 0
+    try:
+        result = sites_col.update_one(
+            {"_id": site_id},
+            {"$set": update_data}
+        )
+        return result.modified_count > 0
+    except Exception as e:
+        logging.error(f"Error updating site {site_id}: {str(e)}")
+        return False
 
 # ================= MENUS =================
 
@@ -252,20 +317,20 @@ def main_menu():
 def site_menu(site_id: str):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔘 Toggle ON/OFF", callback_data=f"toggle:{site_id}"),
-            InlineKeyboardButton("💬 Manage Chats", callback_data=f"chats:{site_id}")
+            InlineKeyboardButton("🔘 Toggle ON/OFF", callback_data=f"toggle_{site_id}"),
+            InlineKeyboardButton("💬 Manage Chats", callback_data=f"chats_{site_id}")
         ],
         [
-            InlineKeyboardButton("🍪 Edit Cookies", callback_data=f"cookies:{site_id}"),
-            InlineKeyboardButton("📝 Edit Headers", callback_data=f"headers:{site_id}")
+            InlineKeyboardButton("🍪 Edit Cookies", callback_data=f"cookies_{site_id}"),
+            InlineKeyboardButton("📝 Edit Headers", callback_data=f"headers_{site_id}")
         ],
         [
-            InlineKeyboardButton("🔄 Test Site", callback_data=f"test:{site_id}"),
-            InlineKeyboardButton("📊 Stats", callback_data=f"site_stats:{site_id}")
+            InlineKeyboardButton("🔄 Test Site", callback_data=f"test_{site_id}"),
+            InlineKeyboardButton("📊 Stats", callback_data=f"site_stats_{site_id}")
         ],
         [
-            InlineKeyboardButton("✏️ Edit Bot Token", callback_data=f"token:{site_id}"),
-            InlineKeyboardButton("🗑 Delete Site", callback_data=f"delete:{site_id}")
+            InlineKeyboardButton("✏️ Edit Bot Token", callback_data=f"token_{site_id}"),
+            InlineKeyboardButton("🗑 Delete Site", callback_data=f"delete_{site_id}")
         ],
         [InlineKeyboardButton("🔙 Back", callback_data="list_sites")]
     ])
@@ -278,6 +343,7 @@ def back_to_main_menu():
 # ================= COMMAND HANDLERS =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command handler"""
     user_id = update.effective_user.id
     
     if not users_col.find_one({"user_id": user_id}):
@@ -288,8 +354,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "joined_at": datetime.utcnow()
         })
     
-    welcome_text = """
-🤖 <b>AK KING 👑 - OTP Forwarder Bot</b>
+    welcome_text = """🤖 <b>AK KING 👑 - OTP Forwarder Bot</b>
 
 <b>Features:</b>
 • Use your own bot token
@@ -304,8 +369,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 3. Add site using this bot
 4. Start receiving OTPs!
 
-Use the buttons below to get started.
-"""
+Use the buttons below to get started."""
     
     await update.message.reply_text(
         welcome_text,
@@ -314,8 +378,8 @@ Use the buttons below to get started.
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-🆘 <b>How to Use This Bot</b>
+    """Help command"""
+    help_text = """🆘 <b>How to Use This Bot</b>
 
 <b>Step 1 - Create Your Bot:</b>
 1. Go to @BotFather on Telegram
@@ -338,8 +402,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Enter your PHPSESSID cookie
 • Use INTS SMS format URL
 
-<b>Support:</b> @botcasx
-"""
+<b>Support:</b> @botcasx"""
     
     await update.message.reply_text(
         help_text,
@@ -348,6 +411,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get chat ID"""
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     
@@ -369,9 +433,11 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= TEXT MESSAGE HANDLER =================
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages"""
     text = update.message.text.strip()
     user_id = update.effective_user.id
     
+    # Check if user is in add site flow
     if "adding_site" in context.user_data:
         step = context.user_data["adding_site"]["step"]
         site_data = context.user_data["adding_site"]["data"]
@@ -524,19 +590,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Add the site
             site_id = add_site(user_id, site_data)
-            site = get_site(site_id)
             
-            success_text = f"""
-✅ <b>Site Added Successfully!</b>
+            success_text = f"""✅ <b>Site Added Successfully!</b>
 
 <b>Site Details:</b>
 • <b>ID:</b> <code>{site_id}</code>
 • <b>Name:</b> {html.escape(site_data['name'])}
 • <b>Bot:</b> @{html.escape(site_data.get('bot_username', 'N/A'))}
 • <b>Chat IDs:</b> {len(site_data['chat_ids'])}
-• <b>URL:</b> <code>{html.escape(site_data['ajax'][:50])}...</code>
 • <b>Type:</b> {site_data['ajax_type']}
-"""
+• <b>Cookies:</b> {len(site_data.get('cookies', {}))} key(s)"""
             
             await update.message.reply_text(
                 success_text,
@@ -544,157 +607,172 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_menu()
             )
             
+            # Clear adding state
             del context.user_data["adding_site"]
         
         return
     
+    # Handle other text inputs
     await update.message.reply_text(
-        "🤖 AK KING 👑 Bot\n\n"
+        "🤖 <b>AK KING 👑 Bot</b>\n\n"
         "Use the buttons or commands to manage your sites.",
+        parse_mode="HTML",
         reply_markup=main_menu()
     )
 
 # ================= CALLBACK HANDLER =================
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle callback queries - FIXED"""
     query = update.callback_query
     await query.answer()
     
-    user_id = query.from_user.id
-    data = query.data
-    
-    if data == "main_menu":
-        await query.message.edit_text(
-            "🤖 <b>AK KING 👑 - Main Menu</b>",
-            parse_mode="HTML",
-            reply_markup=main_menu()
-        )
-    
-    elif data == "add_site":
-        context.user_data["adding_site"] = {
-            "step": 1,
-            "data": {
-                "user_id": user_id,
-                "support_url": "t.me/botcasx"
-            }
-        }
+    try:
+        user_id = query.from_user.id
+        data = query.data
         
-        await query.message.edit_text(
-            "➕ <b>Add New Site - Step 1/5</b>\n\n"
-            "Please enter your <b>Bot Token</b>:\n\n"
-            "<b>How to get Bot Token:</b>\n"
-            "1. Go to @BotFather\n"
-            "2. Send /newbot\n"
-            "3. Follow instructions\n"
-            "4. Copy the token (format: <code>123456:ABCdef...</code>)\n\n"
-            "Enter your bot token:",
-            parse_mode="HTML"
-        )
-    
-    elif data == "list_sites":
-        sites = get_user_sites(user_id)
+        logging.info(f"Callback received: {data} from user {user_id}")
         
-        if not sites:
+        # Main menu
+        if data == "main_menu":
             await query.message.edit_text(
-                "📭 <b>No Sites Found</b>\n\n"
-                "You haven't added any sites yet.\n"
-                "Click 'Add New Site' to get started.",
+                "🤖 <b>AK KING 👑 - Main Menu</b>",
                 parse_mode="HTML",
                 reply_markup=main_menu()
             )
-            return
         
-        keyboard = []
-        for site in sites:
-            status = "🟢" if site.get("enabled", True) else "🔴"
-            name = site.get("name", f"Site-{site['_id'][-6:]}")
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{status} {name}",
-                    callback_data=f"view_site:{site['_id']}"
+        # Add site
+        elif data == "add_site":
+            context.user_data["adding_site"] = {
+                "step": 1,
+                "data": {
+                    "user_id": user_id,
+                    "support_url": "t.me/botcasx"
+                }
+            }
+            
+            await query.message.edit_text(
+                "➕ <b>Add New Site - Step 1/5</b>\n\n"
+                "Please enter your <b>Bot Token</b>:\n\n"
+                "<b>How to get Bot Token:</b>\n"
+                "1. Go to @BotFather\n"
+                "2. Send /newbot\n"
+                "3. Follow instructions\n"
+                "4. Copy the token (format: <code>123456:ABCdef...</code>)\n\n"
+                "Enter your bot token:",
+                parse_mode="HTML"
+            )
+        
+        # List sites
+        elif data == "list_sites":
+            sites = get_user_sites(user_id)
+            
+            if not sites:
+                await query.message.edit_text(
+                    "📭 <b>No Sites Found</b>\n\n"
+                    "You haven't added any sites yet.\n"
+                    "Click 'Add New Site' to get started.",
+                    parse_mode="HTML",
+                    reply_markup=main_menu()
                 )
-            ])
+                return
+            
+            keyboard = []
+            for site in sites:
+                status = "🟢" if site.get("enabled", True) else "🔴"
+                name = site.get("name", f"Site-{site['_id'][-6:]}")
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{status} {name}",
+                        callback_data=f"view_site_{site['_id']}"
+                    )
+                ])
+            
+            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+            
+            await query.message.edit_text(
+                f"📋 <b>Your Sites ({len(sites)})</b>\n\n"
+                "Click on a site to manage it:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
         
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-        
-        await query.message.edit_text(
-            f"📋 <b>Your Sites ({len(sites)})</b>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif data.startswith("view_site:"):
-        site_id = data.split(":", 1)[1]
-        site = get_site(site_id)
-        
-        if not site or site["user_id"] != user_id:
-            await query.message.edit_text("❌ Site not found or access denied")
-            return
-        
-        status = "🟢 Enabled" if site.get("enabled", True) else "🔴 Disabled"
-        stats = site.get("stats", {})
-        
-        text = f"""
-📡 <b>Site Details</b>
+        # View site
+        elif data.startswith("view_site_"):
+            site_id = data.replace("view_site_", "")
+            site = get_site(site_id)
+            
+            if not site or site["user_id"] != user_id:
+                await query.message.edit_text("❌ Site not found or access denied")
+                return
+            
+            status = "🟢 Enabled" if site.get("enabled", True) else "🔴 Disabled"
+            stats = site.get("stats", {})
+            
+            text = f"""📡 <b>Site Details</b>
 
 <b>Name:</b> {html.escape(site.get('name', 'Unnamed'))}
 <b>Status:</b> {status}
 <b>Bot:</b> @{html.escape(site.get('bot_username', 'N/A'))}
 <b>Chat IDs:</b> {len(site.get('chat_ids', []))}
 <b>Type:</b> {site.get('ajax_type', 'standard')}
+<b>Cookies:</b> {len(site.get('cookies', {}))} key(s)
 
 <b>Statistics:</b>
 • Today: {stats.get('today', 0)}
 • Total: {stats.get('total', 0)}
 • Errors: {stats.get('errors', 0)}
 
-<b>URL:</b> <code>{html.escape(site.get('ajax', 'N/A')[:50])}...</code>
-"""
+<b>URL:</b> <code>{html.escape(site.get('ajax', 'N/A')[:50])}...</code>"""
+            
+            if site.get("last_check"):
+                last_check = site["last_check"].strftime("%Y-%m-%d %H:%M:%S")
+                text += f"\n<b>Last Check:</b> {last_check}"
+            
+            await query.message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=site_menu(site_id)
+            )
         
-        if site.get("last_check"):
-            last_check = site["last_check"].strftime("%Y-%m-%d %H:%M:%S")
-            text += f"<b>Last Check:</b> {last_check}\n"
+        # Toggle site
+        elif data.startswith("toggle_"):
+            site_id = data.replace("toggle_", "")
+            site = get_site(site_id)
+            
+            if not site or site["user_id"] != user_id:
+                await query.message.edit_text("❌ Access denied")
+                return
+            
+            new_state = not site.get("enabled", True)
+            update_site(site_id, {"enabled": new_state})
+            
+            status = "✅ enabled" if new_state else "❌ disabled"
+            await query.message.edit_text(f"Site {status}")
         
-        await query.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=site_menu(site_id)
-        )
-    
-    elif data.startswith("toggle:"):
-        site_id = data.split(":", 1)[1]
-        site = get_site(site_id)
-        
-        if not site or site["user_id"] != user_id:
-            await query.message.edit_text("❌ Access denied")
-            return
-        
-        new_state = not site.get("enabled", True)
-        update_site(site_id, {"enabled": new_state})
-        
-        status = "enabled ✅" if new_state else "disabled 🔴"
-        await query.message.edit_text(f"✅ Site {status}")
-    
-    elif data.startswith("test:"):
-        site_id = data.split(":", 1)[1]
-        site = get_site(site_id)
-        
-        if not site or site["user_id"] != user_id:
-            await query.message.edit_text("❌ Access denied")
-            return
-        
-        test_message = format_otp_message(
-            otp="123456",
-            number="+4915511850412",
-            message="Contul dvs WhatsApp Business se inregistreaza pe un nou dispozitiv\n\nNu comunicati nimanui acest cod\nCodul dvs WhatsApp Business 397-838",
-            date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            site_name=site.get("name", "Test Site"),
-            service="WHATSAPP",
-            route="Germany"
-        )
-        
-        try:
-            send_to_telegram(
+        # Test site - FIXED
+        elif data.startswith("test_"):
+            site_id = data.replace("test_", "")
+            site = get_site(site_id)
+            
+            if not site or site["user_id"] != user_id:
+                await query.message.edit_text("❌ Access denied")
+                return
+            
+            # Send a test message with actual sending
+            await query.message.edit_text("🔄 Sending test message...")
+            
+            test_message = format_otp_message(
+                otp="123456",
+                number="+4915511850412",
+                message="This is a test message from AK KING Bot.\n\nYour verification code is 123456\n\nDo not share this code with anyone.",
+                date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                site_name=site.get("name", "Test Site"),
+                service="WHATSAPP",
+                route="Germany"
+            )
+            
+            success = send_to_telegram(
                 bot_token=site["bot_token"],
                 chat_ids=site.get("chat_ids", []),
                 text=test_message,
@@ -702,42 +780,81 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 support_url=site.get("support_url", "t.me/botcasx")
             )
             
+            if success:
+                await query.message.edit_text(
+                    "✅ <b>Test Message Sent Successfully!</b>\n\n"
+                    "Check your specified chats for the test OTP.\n"
+                    "Format used: INTS SMS format\n\n"
+                    "<b>Test Details:</b>\n"
+                    f"• Bot: @{site.get('bot_username', 'N/A')}\n"
+                    f"• Chats: {len(site.get('chat_ids', []))}\n"
+                    f"• Format: HTML",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Back", callback_data=f"view_site_{site_id}")]
+                    ])
+                )
+            else:
+                await query.message.edit_text(
+                    "❌ <b>Test Message Failed</b>\n\n"
+                    "Possible issues:\n"
+                    "1. Bot token is invalid\n"
+                    "2. Bot is not added to chat(s)\n"
+                    "3. Chat IDs are incorrect\n"
+                    "4. Bot doesn't have permission to send messages",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Back", callback_data=f"view_site_{site_id}")]
+                    ])
+                )
+        
+        # Help
+        elif data == "help":
+            help_text = """🆘 <b>How to Use This Bot</b>
+
+<b>Step 1 - Create Your Bot:</b>
+1. Go to @BotFather on Telegram
+2. Send /newbot command
+3. Follow instructions
+4. Copy the bot token
+
+<b>Step 2 - Add Your Site:</b>
+1. Click "Add New Site"
+2. Enter your bot token
+3. Add chat IDs (where OTPs should go)
+4. Enter AJAX URL to monitor
+5. Set site name
+
+<b>Step 3 - Get Chat IDs:</b>
+• For personal chat: Send /id to your bot
+• For group: Add your bot to group, then send /id in group
+
+<b>Step 4 - For INTS SMS Sites:</b>
+• Enter your PHPSESSID cookie
+• Use INTS SMS format URL
+
+<b>Support:</b> @botcasx"""
+            
             await query.message.edit_text(
-                "✅ <b>Test Message Sent!</b>\n\n"
-                "Check your specified chats for the test OTP.\n"
-                "Format used: INTS SMS format",
+                help_text,
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data=f"view_site:{site_id}")]
-                ])
+                reply_markup=back_to_main_menu()
             )
         
-        except Exception as e:
-            await query.message.edit_text(
-                f"❌ <b>Test Failed</b>\n\nError: {html.escape(str(e))}",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data=f"view_site:{site_id}")]
-                ])
-            )
-    
-    elif data == "help":
-        await help_command(update, context)
-    
-    elif data == "stats":
-        sites = get_user_sites(user_id)
-        
-        if not sites:
-            await query.message.edit_text("📭 No sites found")
-            return
-        
-        total_sites = len(sites)
-        active_sites = len([s for s in sites if s.get("enabled", True)])
-        total_today = sum(s.get("stats", {}).get("today", 0) for s in sites)
-        total_all = sum(s.get("stats", {}).get("total", 0) for s in sites)
-        
-        text = f"""
-📊 <b>Your Statistics</b>
+        # Statistics
+        elif data == "stats":
+            sites = get_user_sites(user_id)
+            
+            if not sites:
+                await query.message.edit_text("📭 No sites found")
+                return
+            
+            total_sites = len(sites)
+            active_sites = len([s for s in sites if s.get("enabled", True)])
+            total_today = sum(s.get("stats", {}).get("today", 0) for s in sites)
+            total_all = sum(s.get("stats", {}).get("total", 0) for s in sites)
+            
+            text = f"""📊 <b>Your Statistics</b>
 
 <b>Sites:</b>
 • Total: {total_sites}
@@ -746,29 +863,98 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>OTPs Today:</b> {total_today}
 <b>OTPs Total:</b> {total_all}
 
-<b>Top Sites:</b>
-"""
+<b>Top Sites:</b>"""
+            
+            sorted_sites = sorted(sites, key=lambda x: x.get("stats", {}).get("total", 0), reverse=True)[:5]
+            
+            for i, site in enumerate(sorted_sites, 1):
+                name = site.get("name", f"Site-{site['_id'][-6:]}")
+                today = site.get("stats", {}).get("today", 0)
+                total = site.get("stats", {}).get("total", 0)
+                text += f"\n{i}. {html.escape(name)}: {today} today, {total} total"
+            
+            await query.message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=back_to_main_menu()
+            )
         
-        sorted_sites = sorted(sites, key=lambda x: x.get("stats", {}).get("total", 0), reverse=True)[:5]
-        
-        for i, site in enumerate(sorted_sites, 1):
-            name = site.get("name", f"Site-{site['_id'][-6:]}")
-            today = site.get("stats", {}).get("today", 0)
-            total = site.get("stats", {}).get("total", 0)
-            text += f"{i}. {html.escape(name)}: {today} today, {total} total\n"
-        
+        # Handle other callbacks
+        elif data.startswith("chats_") or data.startswith("cookies_") or data.startswith("headers_") or data.startswith("delete_") or data.startswith("token_") or data.startswith("site_stats_"):
+            parts = data.split("_")
+            if len(parts) >= 2:
+                site_id = parts[1]
+                site = get_site(site_id)
+                
+                if not site or site["user_id"] != user_id:
+                    await query.message.edit_text("❌ Access denied")
+                    return
+                
+                if data.startswith("chats_"):
+                    await query.message.edit_text(
+                        f"💬 <b>Manage Chats for {html.escape(site.get('name', 'Site'))}</b>\n\n"
+                        "Current Chat IDs:\n"
+                        f"{chr(10).join([f'• <code>{cid}</code>' for cid in site.get('chat_ids', [])])}\n\n"
+                        "To modify chat IDs, edit the site settings.",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔙 Back", callback_data=f"view_site_{site_id}")]
+                        ])
+                    )
+                elif data.startswith("cookies_"):
+                    cookies = site.get("cookies", {})
+                    cookies_text = "\n".join([f"• <code>{k}={v}</code>" for k, v in cookies.items()]) if cookies else "No cookies set"
+                    await query.message.edit_text(
+                        f"🍪 <b>Cookies for {html.escape(site.get('name', 'Site'))}</b>\n\n"
+                        f"{cookies_text}\n\n"
+                        "To edit cookies, you need to recreate the site.",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔙 Back", callback_data=f"view_site_{site_id}")]
+                        ])
+                    )
+                elif data.startswith("delete_"):
+                    # Delete site
+                    sites_col.delete_one({"_id": site_id})
+                    await query.message.edit_text(
+                        f"🗑 <b>Site Deleted</b>\n\n"
+                        "The site has been removed from your list.",
+                        parse_mode="HTML",
+                        reply_markup=main_menu()
+                    )
+                else:
+                    await query.message.edit_text(
+                        "⚠️ <b>Feature Coming Soon</b>\n\n"
+                        "This feature is not fully implemented yet.",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔙 Back", callback_data=f"view_site_{site_id}")]
+                        ])
+                    )
+    
+    except Exception as e:
+        logging.error(f"Error in callback handler: {str(e)}", exc_info=True)
         await query.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=back_to_main_menu()
+            f"❌ <b>Error occurred</b>\n\n"
+            f"<code>{html.escape(str(e)[:200])}</code>",
+            parse_mode="HTML"
         )
 
 # ================= POLLER =================
 
 def poller_sync():
-    """Main polling loop - Based on working script"""
+    """Main polling loop - FIXED with all critical patches"""
+    global LAST_RESET
+    
     while True:
         try:
+            # ✅ FIX 4: Optimized daily reset - run only once per day
+            now = datetime.utcnow()
+            if not LAST_RESET or now.date() != LAST_RESET.date():
+                reset_daily_stats()
+                LAST_RESET = now
+                logging.info(f"✅ Daily stats reset at {now}")
+            
             sites = list(sites_col.find({"enabled": True}))
             
             for site in sites:
@@ -779,31 +965,38 @@ def poller_sync():
                         {"$set": {"last_check": datetime.utcnow()}}
                     )
                     
-                    # Prepare session
-                    session = requests.Session()
+                    # ✅ FIX 1: Reuse session instead of creating new one every loop
+                    if site["_id"] not in SITE_SESSIONS:
+                        SITE_SESSIONS[site["_id"]] = get_site_session(site)
                     
-                    # Set headers
-                    headers = site.get("headers", {
-                        "User-Agent": "Mozilla/5.0",
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Accept": "application/json, text/javascript, */*; q=0.01"
-                    })
-                    
-                    # Set cookies
-                    cookies = site.get("cookies", {})
+                    session = SITE_SESSIONS[site["_id"]]
                     
                     # Check if it's INTS SMS type
                     if site.get("ajax_type") == "ints_sms":
-                        # Use working script logic for INTS SMS
                         url = site["ajax"]
                         
                         # Make request
                         response = session.get(
                             url,
-                            headers=headers,
-                            cookies=cookies,
+                            headers=session.headers,
+                            cookies=session.cookies,
                             timeout=20
                         )
+                        
+                        # ✅ FIX 2: Improved HTML detection
+                        content_type = response.headers.get("Content-Type", "").lower()
+                        response_text = response.text.lower()
+                        
+                        if "text/html" in content_type and "<html" in response_text:
+                            logging.warning(f"⚠️ Session expired for {site.get('name')} - Got HTML login page")
+                            sites_col.update_one(
+                                {"_id": site["_id"]},
+                                {"$inc": {"stats.errors": 1}}
+                            )
+                            # Clear session on HTML response (likely expired)
+                            if site["_id"] in SITE_SESSIONS:
+                                del SITE_SESSIONS[site["_id"]]
+                            continue
                         
                         if response.status_code != 200:
                             sites_col.update_one(
@@ -814,7 +1007,8 @@ def poller_sync():
                         
                         try:
                             data = response.json()
-                        except:
+                        except json.JSONDecodeError as e:
+                            logging.error(f"JSON decode error for {site.get('name')}: {str(e)}")
                             sites_col.update_one(
                                 {"_id": site["_id"]},
                                 {"$inc": {"stats.errors": 1}}
@@ -864,7 +1058,13 @@ def poller_sync():
                         if otp == "N/A":
                             continue
                         
-                        # Format message (same as WhatsApp example)
+                        # CRITICAL: Update last_uid BEFORE sending
+                        sites_col.update_one(
+                            {"_id": site["_id"]},
+                            {"$set": {"last_uid": uid}}
+                        )
+                        
+                        # Format message
                         formatted_message = format_otp_message(
                             otp=otp,
                             number=number,
@@ -876,7 +1076,7 @@ def poller_sync():
                         )
                         
                         # Send to Telegram
-                        send_to_telegram(
+                        success = send_to_telegram(
                             bot_token=site["bot_token"],
                             chat_ids=site.get("chat_ids", []),
                             text=formatted_message,
@@ -884,32 +1084,52 @@ def poller_sync():
                             support_url=site.get("support_url", "t.me/botcasx")
                         )
                         
-                        # Update stats
-                        sites_col.update_one(
-                            {"_id": site["_id"]},
-                            {
-                                "$set": {
-                                    "last_uid": uid,
-                                    "last_success": datetime.utcnow()
-                                },
-                                "$inc": {
-                                    "stats.today": 1,
-                                    "stats.total": 1
+                        if success:
+                            # Update stats only if send successful
+                            sites_col.update_one(
+                                {"_id": site["_id"]},
+                                {
+                                    "$set": {"last_success": datetime.utcnow()},
+                                    "$inc": {
+                                        "stats.today": 1,
+                                        "stats.total": 1
+                                    }
                                 }
-                            }
-                        )
-                        
-                        logging.info(f"OTP sent for site {site.get('name')}")
+                            )
+                            
+                            logging.info(f"✅ OTP sent for site {site.get('name')}")
+                        else:
+                            logging.error(f"❌ Failed to send OTP for site {site.get('name')}")
+                            # Rollback last_uid if send failed
+                            sites_col.update_one(
+                                {"_id": site["_id"]},
+                                {"$set": {"last_uid": site.get("last_uid")}}
+                            )
                     
                     else:
-                        # Standard AJAX polling (original logic)
+                        # Standard AJAX polling
                         url = site["ajax"]
                         response = session.get(
                             url,
-                            headers=headers,
-                            cookies=cookies,
+                            headers=session.headers,
+                            cookies=session.cookies,
                             timeout=15
                         )
+                        
+                        # ✅ FIX 2: Improved HTML detection
+                        content_type = response.headers.get("Content-Type", "").lower()
+                        response_text = response.text.lower()
+                        
+                        if "text/html" in content_type and "<html" in response_text:
+                            logging.warning(f"⚠️ HTML login page for {site.get('name')}")
+                            sites_col.update_one(
+                                {"_id": site["_id"]},
+                                {"$inc": {"stats.errors": 1}}
+                            )
+                            # Clear session on HTML response
+                            if site["_id"] in SITE_SESSIONS:
+                                del SITE_SESSIONS[site["_id"]]
+                            continue
                         
                         if response.status_code != 200:
                             sites_col.update_one(
@@ -920,7 +1140,8 @@ def poller_sync():
                         
                         try:
                             data = response.json()
-                        except:
+                        except json.JSONDecodeError as e:
+                            logging.error(f"JSON decode error for {site.get('name')}: {str(e)}")
                             sites_col.update_one(
                                 {"_id": site["_id"]},
                                 {"$inc": {"stats.errors": 1}}
@@ -938,14 +1159,25 @@ def poller_sync():
                             continue
                         
                         # Extract data
-                        message = latest_row[-1] if len(latest_row) > 2 else str(latest_row)
-                        phone_number = latest_row[2] if len(latest_row) > 2 else ""
-                        timestamp = latest_row[0] if latest_row else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        if isinstance(latest_row, list):
+                            message = latest_row[-1] if len(latest_row) > 2 else str(latest_row)
+                            phone_number = latest_row[2] if len(latest_row) > 2 else ""
+                            timestamp = latest_row[0] if latest_row else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            message = str(latest_row)
+                            phone_number = ""
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         
                         # Extract OTP
                         otp = extract_otp(message)
                         if otp == "N/A":
                             continue
+                        
+                        # CRITICAL: Update last_uid BEFORE sending
+                        sites_col.update_one(
+                            {"_id": site["_id"]},
+                            {"$set": {"last_uid": row_id}}
+                        )
                         
                         # Format message
                         formatted_message = format_otp_message(
@@ -957,7 +1189,7 @@ def poller_sync():
                         )
                         
                         # Send to Telegram
-                        send_to_telegram(
+                        success = send_to_telegram(
                             bot_token=site["bot_token"],
                             chat_ids=site.get("chat_ids", []),
                             text=formatted_message,
@@ -965,22 +1197,27 @@ def poller_sync():
                             support_url=site.get("support_url", "t.me/botcasx")
                         )
                         
-                        # Update stats
-                        sites_col.update_one(
-                            {"_id": site["_id"]},
-                            {
-                                "$set": {
-                                    "last_uid": row_id,
-                                    "last_success": datetime.utcnow()
-                                },
-                                "$inc": {
-                                    "stats.today": 1,
-                                    "stats.total": 1
+                        if success:
+                            # Update stats
+                            sites_col.update_one(
+                                {"_id": site["_id"]},
+                                {
+                                    "$set": {"last_success": datetime.utcnow()},
+                                    "$inc": {
+                                        "stats.today": 1,
+                                        "stats.total": 1
+                                    }
                                 }
-                            }
-                        )
-                        
-                        logging.info(f"OTP sent for site {site.get('name')}")
+                            )
+                            
+                            logging.info(f"✅ OTP sent for site {site.get('name')}")
+                        else:
+                            logging.error(f"❌ Failed to send OTP for site {site.get('name')}")
+                            # Rollback last_uid
+                            sites_col.update_one(
+                                {"_id": site["_id"]},
+                                {"$set": {"last_uid": site.get("last_uid")}}
+                            )
                 
                 except Exception as e:
                     logging.error(f"Error polling site {site.get('name', site['_id'])}: {str(e)}")
@@ -989,13 +1226,15 @@ def poller_sync():
                         {"$inc": {"stats.errors": 1}}
                     )
             
-            time.sleep(CHECK_INTERVAL)
+            # Safe polling speed
+            time.sleep(max(7, CHECK_INTERVAL))
         
         except Exception as e:
             logging.error(f"Poller error: {str(e)}")
             time.sleep(30)
 
 def start_poller_thread():
+    """Start poller in a separate thread"""
     poller_thread = threading.Thread(target=poller_sync, daemon=True)
     poller_thread.start()
     logging.info("Poller thread started")
@@ -1003,6 +1242,7 @@ def start_poller_thread():
 # ================= MAIN =================
 
 def main():
+    """Main function - FIXED for Heroku"""
     if not MASTER_BOT_TOKEN:
         print("❌ Error: MASTER_BOT_TOKEN not set!")
         print("Please set MASTER_BOT_TOKEN in environment variables")
@@ -1011,22 +1251,40 @@ def main():
     logging.info("Starting AK KING 👑 bot...")
     
     try:
-        app = ApplicationBuilder().token(MASTER_BOT_TOKEN).build()
+        # Create application with proper settings
+        app = ApplicationBuilder()\
+            .token(MASTER_BOT_TOKEN)\
+            .connection_pool_size(10)\
+            .pool_timeout(30)\
+            .connect_timeout(10)\
+            .read_timeout(10)\
+            .write_timeout(10)\
+            .build()
         
+        # Add handlers in correct order
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("help", help_command))
         app.add_handler(CommandHandler("id", my_id))
+        app.add_handler(CommandHandler("cancel", lambda u, c: None))
         
+        # Add callback handler
         app.add_handler(CallbackQueryHandler(callback_handler))
+        
+        # Add text handler last
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
         
+        # Start poller thread
         start_poller_thread()
         
+        # Run the bot
         logging.info("Bot is starting polling...")
-        app.run_polling()
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
         
     except Exception as e:
-        logging.error(f"Fatal error: {str(e)}")
+        logging.error(f"Fatal error: {str(e)}", exc_info=True)
         exit(1)
 
 if __name__ == "__main__":
