@@ -6,6 +6,7 @@ import json
 import asyncio
 import logging
 import requests
+import threading
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from pymongo import MongoClient
@@ -827,8 +828,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= POLLER =================
 
-async def poller():
-    """Main polling loop"""
+def poller_sync():
+    """Synchronous poller for Heroku"""
     while True:
         try:
             # Get all enabled sites
@@ -922,58 +923,52 @@ async def poller():
                     logging.error(f"Error polling site {site.get('name', site['_id'])}: {str(e)}")
                     update_site(site["_id"], {"$inc": {"stats.errors": 1}})
             
-            await asyncio.sleep(CHECK_INTERVAL)
+            time.sleep(CHECK_INTERVAL)
         
         except Exception as e:
             logging.error(f"Poller error: {str(e)}")
-            await asyncio.sleep(30)
+            time.sleep(30)
+
+def start_poller_thread():
+    """Start poller in a separate thread"""
+    poller_thread = threading.Thread(target=poller_sync, daemon=True)
+    poller_thread.start()
+    logging.info("Poller thread started")
 
 # ================= MAIN =================
 
-def setup_handlers(application):
-    """Setup all handlers"""
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("id", my_id))
-    
-    application.add_handler(CallbackQueryHandler(callback_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-async def main_async():
-    """Main application (async)"""
-    # Create application
-    app = ApplicationBuilder().token(MASTER_BOT_TOKEN).build()
-    
-    # Setup handlers
-    setup_handlers(app)
-    
-    # Start poller
-    asyncio.create_task(poller())
-    
-    # Start bot
-    logging.info("Starting AK KING 👑 bot...")
-    await app.initialize()
-    await app.start()
-    await app.run_polling()
-
 def main():
-    """Main entry point"""
+    """Main function for Heroku"""
     # Check environment variables
     if not MASTER_BOT_TOKEN:
         print("❌ Error: MASTER_BOT_TOKEN not set!")
         print("Please set MASTER_BOT_TOKEN in environment variables")
         exit(1)
     
+    logging.info("Starting AK KING 👑 bot...")
+    
     try:
-        # For Heroku, we need to handle the event loop properly
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main_async())
-    except KeyboardInterrupt:
-        logging.info("Bot stopped by user")
+        # Create application
+        app = ApplicationBuilder().token(MASTER_BOT_TOKEN).build()
+        
+        # Add handlers
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("id", my_id))
+        
+        app.add_handler(CallbackQueryHandler(callback_handler))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+        
+        # Start poller in separate thread
+        start_poller_thread()
+        
+        # Start bot (this will block until stopped)
+        logging.info("Bot is starting polling...")
+        app.run_polling()
+        
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logging.error(f"Fatal error: {str(e)}")
+        exit(1)
 
 if __name__ == "__main__":
     main()
