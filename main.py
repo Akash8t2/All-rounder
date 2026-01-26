@@ -337,7 +337,7 @@ def send_to_telegram(bot_token: str, chat_ids: List[str], text: str, owner_url: 
             reply_markup = {
                 "inline_keyboard": [
                     [
-                        {"text": "Owner", "url": owner_url} if owner_url else {"text": "Owner", "url": "t.me/username"},
+                        {"text": "Owner", "url": owner_url} if owner_url else {"text": "Owner", "url": "https://t.me/+W2ipO5KOmtIzOTU1"},
                         {"text": "🆘 Support", "url": support_url}
                     ]
                 ]
