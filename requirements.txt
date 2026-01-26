@@ -1,4 +1,11 @@
 requests
 pymongo
 telebot
-telegram 
+python-telegram-bot
+aiohttp
+pytz
+python-dotenv
+APScheduler
+beautifulsoup4
+lxml
+schedule
