@@ -28,6 +28,7 @@ from telegram.ext import (
 # ================= CONFIG =================
 
 MASTER_BOT_TOKEN = os.getenv("MASTER_BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "5397621246"))  # Your owner ID
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 CHECK_INTERVAL = 10
 
@@ -38,9 +39,7 @@ logging.basicConfig(
 
 # ================= GLOBAL CACHE =================
 
-# ✅ FIX 1: Session cache for reuse
 SITE_SESSIONS = {}
-# ✅ FIX 4: Daily reset optimization
 LAST_RESET = None
 
 # ================= DB SETUP WITH INDEXES =================
@@ -49,6 +48,7 @@ mongo = MongoClient(MONGO_URI)
 db = mongo["master_bot"]
 sites_col = db["sites"]
 users_col = db["users"]
+admins_col = db["admins"]
 
 # Create indexes for performance
 try:
@@ -57,9 +57,101 @@ try:
     sites_col.create_index("last_uid")
     sites_col.create_index([("user_id", 1), ("enabled", 1)])
     users_col.create_index("user_id", unique=True)
+    admins_col.create_index("user_id", unique=True)
     logging.info("✅ MongoDB indexes created/verified")
 except Exception as e:
     logging.warning(f"⚠️ Could not create indexes: {e}")
+
+# ================= ADMIN SYSTEM =================
+
+def is_owner(user_id: int) -> bool:
+    """Check if user is the owner"""
+    return user_id == OWNER_ID
+
+def is_admin(user_id: int) -> bool:
+    """Check if user is owner or admin"""
+    if is_owner(user_id):
+        return True
+    return admins_col.find_one({"user_id": user_id}) is not None
+
+# ================= SMS FORMAT SYSTEM =================
+
+DEFAULT_SMS_FORMAT = """📩 <b>LIVE OTP RECEIVED</b>
+
+📞 <b>Number:</b> <code>{number}</code>
+🔢 <b>OTP:</b> 🔥 <code>{otp}</code> 🔥
+🏷 <b>Service:</b> {service}
+🌍 <b>Country:</b> {country}
+🕒 <b>Time:</b> {time}
+
+💬 <b>SMS:</b>
+{message}
+
+⚡ <b>—͟͟͞͞𝗔𝗞𝗔𝗦𝗛 🥀</b>"""
+
+def render_sms(site: Dict, data: Dict) -> str:
+    """Render SMS using site's custom format or default"""
+    template = site.get("sms_format", {}).get("template", DEFAULT_SMS_FORMAT)
+    
+    # Ensure all variables are available
+    safe_data = {
+        "otp": html.escape(data.get("otp", "N/A")),
+        "number": html.escape(data.get("number", "N/A")),
+        "message": html.escape(data.get("message", "")),
+        "time": html.escape(data.get("date", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))),
+        "service": html.escape(data.get("service", "Unknown")),
+        "country": html.escape(data.get("country", get_country_from_number(data.get("number", ""))))
+    }
+    
+    try:
+        return template.format(**safe_data)
+    except KeyError as e:
+        logging.error(f"Missing variable in SMS template: {e}")
+        # Fallback to default format with error message
+        error_msg = f"⚠️ Template Error: Invalid variable {e}"
+        return error_msg + "\n\n" + DEFAULT_SMS_FORMAT.format(**safe_data)
+
+# ================= BUTTON SYSTEM =================
+
+DEFAULT_BUTTONS = [
+    {"text": "🆘 Support", "url": "t.me/botcasx", "enabled": True},
+    {"text": "📲 Numbers", "url": "t.me/numbers", "enabled": True}
+]
+
+def build_buttons(site: Dict):
+    """Build inline keyboard from site's button configuration"""
+    buttons = site.get("buttons", [])
+    
+    if not buttons:
+        # Default buttons if none configured
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "Owner", "url": site.get("owner_url", "t.me/username")},
+                    {"text": "🆘 Support", "url": site.get("support_url", "t.me/botcasx")}
+                ]
+            ]
+        }
+    
+    # Group buttons (max 2 per row)
+    keyboard = []
+    row = []
+    
+    for button in buttons[:4]:  # Max 4 buttons
+        if button.get("enabled", True):
+            row.append({
+                "text": button.get("text", "Button"),
+                "url": button.get("url", "")
+            })
+            
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+    
+    if row:
+        keyboard.append(row)
+    
+    return {"inline_keyboard": keyboard} if keyboard else None
 
 # ================= HELPER FUNCTIONS =================
 
@@ -68,24 +160,20 @@ def extract_otp(text: str) -> str:
     if not text:
         return "N/A"
     
-    # More specific patterns to avoid phone numbers/prices
     patterns = [
         r'(?:OTP|code|verification|password|पासकोड|कोड)[^\d]{0,10}(\d{4,8})',
-        r'\b(?!\d{9,})(\d{4,8})\b',  # Avoid 9+ digit numbers
+        r'\b(?!\d{9,})(\d{4,8})\b',
         r'(?:is|का|की)[^\d]{0,5}(\d{4,8})',
         r'[:\-\s]\s*(\d{4,8})\b'
     ]
     
-    # First try specific patterns
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             otp = m.group(1)
-            # Validate OTP length
             if 4 <= len(otp) <= 8:
                 return otp
     
-    # Fallback: look for isolated 4-8 digit numbers
     fallback_patterns = [
         r'\b(\d{4})\b',
         r'\b(\d{5})\b',
@@ -97,9 +185,7 @@ def extract_otp(text: str) -> str:
     for pattern in fallback_patterns:
         matches = re.findall(pattern, text)
         if matches:
-            # Filter out phone numbers (usually in sequence)
             for match in matches:
-                # Check if this looks like part of a phone number
                 context = re.search(r'\b\d{9,}\b', text)
                 if not context:
                     return match
@@ -118,168 +204,30 @@ def get_country_from_number(number: str) -> str:
         return "Unknown"
     
     prefixes = {
-    '1': '🇺🇸 USA / 🇨🇦 Canada',
-    '7': '🇷🇺 Russia / 🇰🇿 Kazakhstan',
-    '20': '🇪🇬 Egypt',
-    '27': '🇿🇦 South Africa',
-    '30': '🇬🇷 Greece',
-    '31': '🇳🇱 Netherlands',
-    '32': '🇧🇪 Belgium',
-    '33': '🇫🇷 France',
-    '34': '🇪🇸 Spain',
-    '36': '🇭🇺 Hungary',
-    '39': '🇮🇹 Italy',
-    '40': '🇷🇴 Romania',
-    '41': '🇨🇭 Switzerland',
-    '43': '🇦🇹 Austria',
-    '44': '🇬🇧 United Kingdom',
-    '45': '🇩🇰 Denmark',
-    '46': '🇸🇪 Sweden',
-    '47': '🇳🇴 Norway',
-    '48': '🇵🇱 Poland',
-    '49': '🇩🇪 Germany',
-    '51': '🇵🇪 Peru',
-    '52': '🇲🇽 Mexico',
-    '53': '🇨🇺 Cuba',
-    '54': '🇦🇷 Argentina',
-    '55': '🇧🇷 Brazil',
-    '56': '🇨🇱 Chile',
-    '57': '🇨🇴 Colombia',
-    '58': '🇻🇪 Venezuela',
-    '60': '🇲🇾 Malaysia',
-    '61': '🇦🇺 Australia',
-    '62': '🇮🇩 Indonesia',
-    '63': '🇵🇭 Philippines',
-    '64': '🇳🇿 New Zealand',
-    '65': '🇸🇬 Singapore',
-    '66': '🇹🇭 Thailand',
-    '81': '🇯🇵 Japan',
-    '82': '🇰🇷 South Korea',
-    '84': '🇻🇳 Vietnam',
-    '86': '🇨🇳 China',
-    '90': '🇹🇷 Turkey',
-    '91': '🇮🇳 India',
-    '92': '🇵🇰 Pakistan',
-    '93': '🇦🇫 Afghanistan',
-    '94': '🇱🇰 Sri Lanka',
-    '95': '🇲🇲 Myanmar',
-    '98': '🇮🇷 Iran',
-
-    '211': '🇸🇸 South Sudan',
-    '212': '🇲🇦 Morocco',
-    '213': '🇩🇿 Algeria',
-    '216': '🇹🇳 Tunisia',
-    '218': '🇱🇾 Libya',
-    '220': '🇬🇲 Gambia',
-    '221': '🇸🇳 Senegal',
-    '222': '🇲🇷 Mauritania',
-    '223': '🇲🇱 Mali',
-    '224': '🇬🇳 Guinea',
-    '225': '🇨🇮 Ivory Coast',
-    '226': '🇧🇫 Burkina Faso',
-    '227': '🇳🇪 Niger',
-    '228': '🇹🇬 Togo',
-    '229': '🇧🇯 Benin',
-    '230': '🇲🇺 Mauritius',
-    '231': '🇱🇷 Liberia',
-    '232': '🇸🇱 Sierra Leone',
-    '233': '🇬🇭 Ghana',
-    '234': '🇳🇬 Nigeria',
-    '235': '🇹🇩 Chad',
-    '236': '🇨🇫 Central African Republic',
-    '237': '🇨🇲 Cameroon',
-    '238': '🇨🇻 Cape Verde',
-    '239': '🇸🇹 Sao Tome & Principe',
-    '240': '🇬🇶 Equatorial Guinea',
-    '241': '🇬🇦 Gabon',
-    '242': '🇨🇬 Congo',
-    '243': '🇨🇩 DR Congo',
-    '244': '🇦🇴 Angola',
-    '245': '🇬🇼 Guinea-Bissau',
-    '246': '🇮🇴 British Indian Ocean Territory',
-    '248': '🇸🇨 Seychelles',
-    '249': '🇸🇩 Sudan',
-    '250': '🇷🇼 Rwanda',
-    '251': '🇪🇹 Ethiopia',
-    '252': '🇸🇴 Somalia',
-    '253': '🇩🇯 Djibouti',
-    '254': '🇰🇪 Kenya',
-    '255': '🇹🇿 Tanzania',
-    '256': '🇺🇬 Uganda',
-    '257': '🇧🇮 Burundi',
-    '258': '🇲🇿 Mozambique',
-    '260': '🇿🇲 Zambia',
-    '261': '🇲🇬 Madagascar',
-    '262': '🇷🇪 Reunion',
-    '263': '🇿🇼 Zimbabwe',
-    '264': '🇳🇦 Namibia',
-    '265': '🇲🇼 Malawi',
-    '266': '🇱🇸 Lesotho',
-    '267': '🇧🇼 Botswana',
-    '268': '🇸🇿 Eswatini',
-    '269': '🇰🇲 Comoros',
-
-    '351': '🇵🇹 Portugal',
-    '352': '🇱🇺 Luxembourg',
-    '353': '🇮🇪 Ireland',
-    '354': '🇮🇸 Iceland',
-    '355': '🇦🇱 Albania',
-    '356': '🇲🇹 Malta',
-    '357': '🇨🇾 Cyprus',
-    '358': '🇫🇮 Finland',
-    '359': '🇧🇬 Bulgaria',
-    '370': '🇱🇹 Lithuania',
-    '371': '🇱🇻 Latvia',
-    '372': '🇪🇪 Estonia',
-    '373': '🇲🇩 Moldova',
-    '374': '🇦🇲 Armenia',
-    '375': '🇧🇾 Belarus',
-    '376': '🇦🇩 Andorra',
-    '377': '🇲🇨 Monaco',
-    '378': '🇸🇲 San Marino',
-    '380': '🇺🇦 Ukraine',
-    '381': '🇷🇸 Serbia',
-    '382': '🇲🇪 Montenegro',
-    '383': '🇽🇰 Kosovo',
-    '385': '🇭🇷 Croatia',
-    '386': '🇸🇮 Slovenia',
-    '387': '🇧🇦 Bosnia & Herzegovina',
-    '389': '🇲🇰 North Macedonia',
-
-    '420': '🇨🇿 Czech Republic',
-    '421': '🇸🇰 Slovakia',
-    '423': '🇱🇮 Liechtenstein',
-
-    '852': '🇭🇰 Hong Kong',
-    '853': '🇲🇴 Macau',
-    '855': '🇰🇭 Cambodia',
-    '856': '🇱🇦 Laos',
-    '880': '🇧🇩 Bangladesh',
-    '886': '🇹🇼 Taiwan',
-
-    '960': '🇲🇻 Maldives',
-    '961': '🇱🇧 Lebanon',
-    '962': '🇯🇴 Jordan',
-    '963': '🇸🇾 Syria',
-    '964': '🇮🇶 Iraq',
-    '965': '🇰🇼 Kuwait',
-    '966': '🇸🇦 Saudi Arabia',
-    '967': '🇾🇪 Yemen',
-    '968': '🇴🇲 Oman',
-    '970': '🇵🇸 Palestine',
-    '971': '🇦🇪 UAE',
-    '972': '🇮🇱 Israel',
-    '973': '🇧🇭 Bahrain',
-    '974': '🇶🇦 Qatar',
-    '975': '🇧🇹 Bhutan',
-    '976': '🇲🇳 Mongolia',
-    '977': '🇳🇵 Nepal',
-    '992': '🇹🇯 Tajikistan',
-    '993': '🇹🇲 Turkmenistan',
-    '994': '🇦🇿 Azerbaijan',
-    '995': '🇬🇪 Georgia',
-    '996': '🇰🇬 Kyrgyzstan',
-    '998': '🇺🇿 Uzbekistan',
+        '1': '🇺🇸 USA',
+        '91': '🇮🇳 India',
+        '44': '🇬🇧 UK',
+        '86': '🇨🇳 China',
+        '33': '🇫🇷 France',
+        '49': '🇩🇪 Germany',
+        '81': '🇯🇵 Japan',
+        '7': '🇷🇺 Russia',
+        '92': '🇵🇰 Pakistan',
+        '880': '🇧🇩 Bangladesh',
+        '94': '🇱🇰 Sri Lanka',
+        '971': '🇦🇪 UAE',
+        '966': '🇸🇦 Saudi Arabia',
+        '65': '🇸🇬 Singapore',
+        '60': '🇲🇾 Malaysia',
+        '63': '🇵🇭 Philippines',
+        '62': '🇮🇩 Indonesia',
+        '84': '🇻🇳 Vietnam',
+        '66': '🇹🇭 Thailand',
+        '55': '🇧🇷 Brazil',
+        '34': '🇪🇸 Spain',
+        '39': '🇮🇹 Italy',
+        '61': '🇦🇺 Australia',
+        '27': '🇿🇦 South Africa',
     }
     
     for prefix, country in prefixes.items():
@@ -287,32 +235,6 @@ def get_country_from_number(number: str) -> str:
             return country
     
     return "🌍 International"
-
-def format_otp_message(otp: str, number: str, message: str, date: str, site_name: str, route: str = "", service: str = "") -> str:
-    """Format OTP message with proper HTML escaping"""
-    safe_otp = html.escape(otp)
-    safe_number = html.escape(number) if number else "N/A"
-    safe_message = html.escape(message)
-    safe_site_name = html.escape(site_name)
-    safe_service = html.escape(service) if service else safe_site_name
-    
-    result = "📩 <b>LIVE OTP RECEIVED</b>\n\n"
-    result += f"📞 <b>Number:</b> <code>{safe_number}</code>\n"
-    result += f"🔢 <b>OTP:</b> 🔥 <code>{safe_otp}</code> 🔥\n"
-    result += f"🏷 <b>Service:</b> {safe_service}\n"
-    
-    if route and route != "Unknown":
-        country_from_route = route.split("-")[0] if "-" in route else route
-        result += f"🌍 <b>Country:</b> {country_from_route}\n"
-    else:
-        country = get_country_from_number(number)
-        result += f"🌍 <b>Country:</b> {country}\n"
-    
-    result += f"🕒 <b>Time:</b> {date}\n\n"
-    result += f"💬 <b>SMS:</b>\n{safe_message}\n\n"
-    result += "⚡ <b>—͟͟͞͞𝗔𝗞𝗔𝗦𝗛 🥀</b>"
-    
-    return result
 
 def get_site_session(site):
     """Create and return a persistent session for the site"""
@@ -325,43 +247,36 @@ def get_site_session(site):
     s.cookies.update(site.get("cookies", {}))
     return s
 
-# ✅ FIX 3: send_to_telegram() returns correctly for all chats
-def send_to_telegram(bot_token: str, chat_ids: List[str], text: str, owner_url: str = "", support_url: str = "t.me/botcasx"):
-    """Send message to Telegram - IMPROVED"""
+def send_to_telegram(bot_token: str, chat_ids: List[str], text: str, site: Dict):
+    """Send message to Telegram with custom buttons"""
     success = True
+    
+    # Get buttons for this site
+    reply_markup = build_buttons(site)
     
     for chat_id in chat_ids:
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            
-            reply_markup = {
-                "inline_keyboard": [
-                    [
-                        {"text": "Owner", "url": owner_url} if owner_url else {"text": "Owner", "url": "https://t.me/+W2ipO5KOmtIzOTU1"},
-                        {"text": "🆘 Support", "url": support_url}
-                    ]
-                ]
-            }
             
             payload = {
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
-                "reply_markup": json.dumps(reply_markup)
             }
+            
+            if reply_markup:
+                payload["reply_markup"] = json.dumps(reply_markup)
             
             response = requests.post(url, json=payload, timeout=10)
             
             if response.status_code != 200:
                 logging.error(f"Failed to send to chat {chat_id}: {response.text}")
                 success = False
-                # Don't return here - try sending to other chats
         
         except Exception as e:
             logging.error(f"Error sending to Telegram for chat {chat_id}: {str(e)}")
             success = False
-            # Continue trying other chats
     
     return success
 
@@ -369,7 +284,6 @@ def reset_daily_stats():
     """Reset daily statistics at midnight UTC"""
     today = datetime.utcnow().strftime("%Y-%m-%d")
     
-    # Update all sites where last_day is not today
     result = sites_col.update_many(
         {"stats.last_day": {"$ne": today}},
         {
@@ -393,9 +307,14 @@ def add_site(user_id: int, site_data: Dict) -> str:
     if isinstance(chat_ids, str):
         chat_ids = [chat_ids]
     
+    default_buttons = [
+        {"text": "🆘 Support", "url": site_data.get("support_url", "t.me/botcasx"), "enabled": True},
+        {"text": "Owner", "url": site_data.get("owner_url", ""), "enabled": True}
+    ]
+    
     site_data.update({
         "_id": site_id,
-        "user_id": user_id,
+        "user_id": user_id,  # Admin who created this site (owns it)
         "chat_ids": chat_ids,
         "enabled": True,
         "created_at": datetime.utcnow(),
@@ -416,15 +335,25 @@ def add_site(user_id: int, site_data: Dict) -> str:
         }),
         "owner_url": site_data.get("owner_url", ""),
         "support_url": site_data.get("support_url", "t.me/botcasx"),
-        "ajax_type": site_data.get("ajax_type", "standard")
+        "ajax_type": site_data.get("ajax_type", "standard"),
+        "buttons": default_buttons,
+        "sms_format": {
+            "template": DEFAULT_SMS_FORMAT,
+            "created_at": datetime.utcnow()
+        }
     })
     
     sites_col.insert_one(site_data)
     return site_id
 
 def get_user_sites(user_id: int) -> List[Dict]:
-    """Get all sites for a user"""
-    return list(sites_col.find({"user_id": user_id}))
+    """Get all sites for a user - FIXED PER REQUIREMENTS"""
+    if is_owner(user_id):
+        # Owner can see all sites
+        return list(sites_col.find({}))
+    else:
+        # Admin can see ONLY own sites
+        return list(sites_col.find({"user_id": user_id}))
 
 def get_site(site_id: str) -> Optional[Dict]:
     """Get site by ID"""
@@ -459,6 +388,10 @@ def site_menu(site_id: str):
             InlineKeyboardButton("💬 Manage Chats", callback_data=f"chats_{site_id}")
         ],
         [
+            InlineKeyboardButton("✏️ Edit SMS Format", callback_data=f"format_{site_id}"),
+            InlineKeyboardButton("🔘 Edit Buttons", callback_data=f"buttons_{site_id}")
+        ],
+        [
             InlineKeyboardButton("🍪 Edit Cookies", callback_data=f"cookies_{site_id}"),
             InlineKeyboardButton("📝 Edit Headers", callback_data=f"headers_{site_id}")
         ],
@@ -484,15 +417,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
     user_id = update.effective_user.id
     
+    # Check admin access
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "❌ <b>Access Denied</b>\n\n"
+            "You are not authorized to use this bot.\n"
+            "Only owner and admins can access this system.",
+            parse_mode="HTML"
+        )
+        return
+    
     if not users_col.find_one({"user_id": user_id}):
         users_col.insert_one({
             "user_id": user_id,
             "username": update.effective_user.username,
             "first_name": update.effective_user.first_name,
-            "joined_at": datetime.utcnow()
+            "joined_at": datetime.utcnow(),
+            "role": "owner" if is_owner(user_id) else "admin"
         })
     
-    welcome_text = """🤖 <b>AK KING 👑 - OTP Forwarder Bot</b>
+    welcome_text = f"""🤖 <b>AK KING 👑 - OTP Forwarder Bot</b>
+
+<b>Access Level:</b> {'👑 Owner' if is_owner(user_id) else '🛡 Admin'}
 
 <b>Features:</b>
 • Use your own bot token
@@ -500,6 +446,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Live OTP forwarding
 • Cookie & header management
 • INTS SMS format support
+• Custom SMS formatting
+• Custom inline buttons
 
 <b>Quick Start:</b>
 1. Create your own bot via @BotFather
@@ -517,6 +465,17 @@ Use the buttons below to get started."""
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help command"""
+    user_id = update.effective_user.id
+    
+    # Check admin access
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "❌ <b>Access Denied</b>\n\n"
+            "You are not authorized to use this bot.",
+            parse_mode="HTML"
+        )
+        return
+    
     help_text = """🆘 <b>How to Use This Bot</b>
 
 <b>Step 1 - Create Your Bot:</b>
@@ -540,6 +499,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Enter your PHPSESSID cookie
 • Use INTS SMS format URL
 
+<b>Step 5 - Customization:</b>
+• Edit SMS format per site
+• Edit inline buttons per site
+• Manage admins (owner only)
+
+<b>Admin Commands:</b>
+/addadmin USER_ID - Add admin (owner only)
+/removeadmin USER_ID - Remove admin (owner only)
+/listadmins - List all admins
+/access - Check your access level
+
 <b>Support:</b> @botcasx"""
     
     await update.message.reply_text(
@@ -550,6 +520,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get chat ID"""
+    user_id = update.effective_user.id
+    
+    # Check admin access
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "❌ <b>Access Denied</b>\n\n"
+            "You are not authorized to use this bot.",
+            parse_mode="HTML"
+        )
+        return
+    
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     
@@ -568,12 +549,254 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+# ================= ADMIN COMMANDS =================
+
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add new admin - OWNER ONLY"""
+    user_id = update.effective_user.id
+    
+    if not is_owner(user_id):
+        await update.message.reply_text(
+            "❌ <b>Owner Only</b>\n\n"
+            "This command is reserved for the bot owner only.",
+            parse_mode="HTML"
+        )
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /addadmin <user_id>\n\n"
+            "Example: /addadmin 123456789"
+        )
+        return
+    
+    try:
+        uid = int(context.args[0])
+        
+        # Cannot add self
+        if uid == OWNER_ID:
+            await update.message.reply_text("❌ Owner is already admin!")
+            return
+        
+        # Check if already admin
+        existing = admins_col.find_one({"user_id": uid})
+        if existing:
+            await update.message.reply_text(f"⚠️ User {uid} is already an admin")
+            return
+        
+        # Add to admins
+        admins_col.insert_one({
+            "user_id": uid,
+            "added_by": update.effective_user.id,
+            "added_at": datetime.utcnow(),
+            "level": "admin"
+        })
+        
+        await update.message.reply_text(
+            f"✅ <b>Admin Added Successfully</b>\n\n"
+            f"User ID: <code>{uid}</code>\n"
+            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
+            parse_mode="HTML"
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID format")
+    except Exception as e:
+        logging.error(f"Error adding admin: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove admin - OWNER ONLY"""
+    user_id = update.effective_user.id
+    
+    if not is_owner(user_id):
+        await update.message.reply_text(
+            "❌ <b>Owner Only</b>\n\n"
+            "This command is reserved for the bot owner only.",
+            parse_mode="HTML"
+        )
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /removeadmin <user_id>\n\n"
+            "Example: /removeadmin 123456789"
+        )
+        return
+    
+    try:
+        uid = int(context.args[0])
+        
+        # Cannot remove owner
+        if uid == OWNER_ID:
+            await update.message.reply_text("❌ Cannot remove owner!")
+            return
+        
+        # Remove from admins
+        result = admins_col.delete_one({"user_id": uid})
+        
+        if result.deleted_count > 0:
+            await update.message.reply_text(
+                f"✅ <b>Admin Removed</b>\n\n"
+                f"User ID: <code>{uid}</code>\n"
+                f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(f"❌ User {uid} is not an admin")
+            
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID format")
+    except Exception as e:
+        logging.error(f"Error removing admin: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all admins"""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "❌ <b>Access Denied</b>\n\n"
+            "You are not authorized to use this command.",
+            parse_mode="HTML"
+        )
+        return
+    
+    admins = list(admins_col.find({}))
+    
+    text = "👑 <b>Admin List</b>\n\n"
+    text += f"<b>Owner:</b> <code>{OWNER_ID}</code>\n\n"
+    
+    if admins:
+        text += "<b>Admins:</b>\n"
+        for i, admin in enumerate(admins, 1):
+            text += f"{i}. <code>{admin['user_id']}</code>\n"
+            if admin.get('added_at'):
+                added_time = admin['added_at'].strftime('%Y-%m-%d')
+                text += f"   Added: {added_time}\n"
+    else:
+        text += "No additional admins.\n"
+    
+    text += f"\nTotal Admins: {len(admins)}"
+    
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check user's access level"""
+    user_id = update.effective_user.id
+    
+    if is_owner(user_id):
+        role = "👑 Owner"
+    elif is_admin(user_id):
+        role = "🛡 Admin"
+    else:
+        role = "👤 User"
+    
+    await update.message.reply_text(
+        f"🔐 <b>Access Level</b>\n\n"
+        f"<b>User ID:</b> <code>{user_id}</code>\n"
+        f"<b>Role:</b> {role}\n"
+        f"<b>Status:</b> {'✅ Authorized' if is_admin(user_id) else '❌ Unauthorized'}",
+        parse_mode="HTML"
+    )
+
 # ================= TEXT MESSAGE HANDLER =================
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages"""
-    text = update.message.text.strip()
     user_id = update.effective_user.id
+    
+    # Check admin access
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "❌ <b>Access Denied</b>\n\n"
+            "You are not authorized to use this bot.",
+            parse_mode="HTML"
+        )
+        return
+    
+    text = update.message.text.strip()
+    
+    # Handle SMS format editing
+    if "edit_format" in context.user_data and context.user_data.get("edit_format_step") == "get_format":
+        site_id = context.user_data.pop("edit_format")
+        context.user_data.pop("edit_format_step", None)
+        
+        # Save the new format
+        update_site(site_id, {
+            "sms_format": {
+                "template": text,
+                "updated_at": datetime.utcnow(),
+                "updated_by": update.effective_user.id
+            }
+        })
+        
+        await update.message.reply_text(
+            "✅ <b>SMS Format Updated Successfully!</b>\n\n"
+            "The new format will be used for all future OTP messages.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Handle button text editing
+    if "edit_button_text" in context.user_data:
+        site_id = context.user_data["edit_button_text"]["site_id"]
+        btn_index = context.user_data["edit_button_text"]["btn_index"]
+        
+        site = get_site(site_id)
+        if site and (is_owner(user_id) or site["user_id"] == user_id):  # FIXED: Check ownership
+            buttons = site.get("buttons", DEFAULT_BUTTONS).copy()
+            if btn_index < len(buttons):
+                buttons[btn_index]["text"] = text
+                update_site(site_id, {"buttons": buttons})
+                
+                await update.message.reply_text(
+                    f"✅ <b>Button Text Updated</b>\n\n"
+                    f"New text: {html.escape(text)}",
+                    parse_mode="HTML"
+                )
+        
+        context.user_data.pop("edit_button_text", None)
+        return
+    
+    # Handle button URL editing
+    if "edit_button_url" in context.user_data:
+        site_id = context.user_data["edit_button_url"]["site_id"]
+        btn_index = context.user_data["edit_button_url"]["btn_index"]
+        
+        # ✅ FIX: Auto-fix t.me/ URLs
+        if text.startswith("t.me/"):
+            text = "https://" + text
+        
+        # Validate URL
+        if not (text.startswith("http://") or text.startswith("https://") or text.startswith("tg://")):
+            await update.message.reply_text(
+                "❌ <b>Invalid URL format</b>\n\n"
+                "URL must start with:\n"
+                "• http:// or https://\n"
+                "• tg:// (Telegram deep link)\n"
+                "• t.me/ (Telegram username)\n\n"
+                "Please enter a valid URL:",
+                parse_mode="HTML"
+            )
+            return
+        
+        site = get_site(site_id)
+        if site and (is_owner(user_id) or site["user_id"] == user_id):  # FIXED: Check ownership
+            buttons = site.get("buttons", DEFAULT_BUTTONS).copy()
+            if btn_index < len(buttons):
+                buttons[btn_index]["url"] = text
+                update_site(site_id, {"buttons": buttons})
+                
+                await update.message.reply_text(
+                    f"✅ <b>Button URL Updated</b>\n\n"
+                    f"New URL: {html.escape(text)}",
+                    parse_mode="HTML"
+                )
+        
+        context.user_data.pop("edit_button_url", None)
+        return
     
     # Check if user is in add site flow
     if "adding_site" in context.user_data:
@@ -737,7 +960,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • <b>Bot:</b> @{html.escape(site_data.get('bot_username', 'N/A'))}
 • <b>Chat IDs:</b> {len(site_data['chat_ids'])}
 • <b>Type:</b> {site_data['ajax_type']}
-• <b>Cookies:</b> {len(site_data.get('cookies', {}))} key(s)"""
+• <b>Cookies:</b> {len(site_data.get('cookies', {}))} key(s)}"""
             
             await update.message.reply_text(
                 success_text,
@@ -761,7 +984,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= CALLBACK HANDLER =================
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle callback queries - FIXED"""
+    """Handle callback queries"""
     query = update.callback_query
     await query.answer()
     
@@ -770,6 +993,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = query.data
         
         logging.info(f"Callback received: {data} from user {user_id}")
+        
+        # Check admin access for all callbacks except main_menu
+        if data != "main_menu" and not is_admin(user_id):
+            await query.message.edit_text(
+                "❌ <b>Access Denied</b>\n\n"
+                "You are not authorized to use this bot.\n"
+                "Contact the owner for access.",
+                parse_mode="HTML"
+            )
+            return
         
         # Main menu
         if data == "main_menu":
@@ -835,12 +1068,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         
-        # View site
+        # View site - FIXED: Check ownership
         elif data.startswith("view_site_"):
             site_id = data.replace("view_site_", "")
             site = get_site(site_id)
             
-            if not site or site["user_id"] != user_id:
+            # ✅ FIXED: Owner can see all, admin only own sites
+            if not site or (not is_owner(user_id) and site["user_id"] != user_id):
                 await query.message.edit_text("❌ Site not found or access denied")
                 return
             
@@ -855,6 +1089,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>Chat IDs:</b> {len(site.get('chat_ids', []))}
 <b>Type:</b> {site.get('ajax_type', 'standard')}
 <b>Cookies:</b> {len(site.get('cookies', {}))} key(s)
+<b>Buttons:</b> {len(site.get('buttons', []))} configured
 
 <b>Statistics:</b>
 • Today: {stats.get('today', 0)}
@@ -873,12 +1108,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=site_menu(site_id)
             )
         
-        # Toggle site
+        # Toggle site - FIXED: Check ownership
         elif data.startswith("toggle_"):
             site_id = data.replace("toggle_", "")
             site = get_site(site_id)
             
-            if not site or site["user_id"] != user_id:
+            # ✅ FIXED: Owner can toggle all, admin only own sites
+            if not site or (not is_owner(user_id) and site["user_id"] != user_id):
                 await query.message.edit_text("❌ Access denied")
                 return
             
@@ -888,44 +1124,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = "✅ enabled" if new_state else "❌ disabled"
             await query.message.edit_text(f"Site {status}")
         
-        # Test site - FIXED
+        # Test site - FIXED: Check ownership
         elif data.startswith("test_"):
             site_id = data.replace("test_", "")
             site = get_site(site_id)
             
-            if not site or site["user_id"] != user_id:
+            # ✅ FIXED: Owner can test all, admin only own sites
+            if not site or (not is_owner(user_id) and site["user_id"] != user_id):
                 await query.message.edit_text("❌ Access denied")
                 return
             
             # Send a test message with actual sending
             await query.message.edit_text("🔄 Sending test message...")
             
-            test_message = format_otp_message(
-                otp="123456",
-                number="+4915511850412",
-                message="This is a test message from AK KING Bot.\n\nYour verification code is 123456\n\nDo not share this code with anyone.",
-                date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                site_name=site.get("name", "Test Site"),
-                service="WHATSAPP",
-                route="Germany"
-            )
+            test_message = render_sms(site, {
+                "otp": "123456",
+                "number": "+4915511850412",
+                "message": "This is a test message from AK KING Bot.\n\nYour verification code is 123456\n\nDo not share this code with anyone.",
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "service": "WHATSAPP",
+                "country": "Germany"
+            })
             
             success = send_to_telegram(
                 bot_token=site["bot_token"],
                 chat_ids=site.get("chat_ids", []),
                 text=test_message,
-                owner_url=site.get("owner_url", ""),
-                support_url=site.get("support_url", "t.me/botcasx")
+                site=site
             )
             
             if success:
                 await query.message.edit_text(
                     "✅ <b>Test Message Sent Successfully!</b>\n\n"
                     "Check your specified chats for the test OTP.\n"
-                    "Format used: INTS SMS format\n\n"
+                    "Format used: Custom SMS format\n\n"
                     "<b>Test Details:</b>\n"
                     f"• Bot: @{site.get('bot_username', 'N/A')}\n"
                     f"• Chats: {len(site.get('chat_ids', []))}\n"
+                    f"• Buttons: {len(site.get('buttons', []))}\n"
                     f"• Format: HTML",
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup([
@@ -945,6 +1181,278 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("🔙 Back", callback_data=f"view_site_{site_id}")]
                     ])
                 )
+        
+        # SMS Format editor - FIXED: Check ownership
+        elif data.startswith("format_"):
+            site_id = data.replace("format_", "")
+            site = get_site(site_id)
+            
+            # ✅ FIXED: Owner can edit all, admin only own sites
+            if not site or (not is_owner(user_id) and site["user_id"] != user_id):
+                await query.message.edit_text("❌ Access denied")
+                return
+            
+            # Store in context for text handler
+            context.user_data["edit_format"] = site_id
+            context.user_data["edit_format_step"] = "get_format"
+            
+            current_format = site.get("sms_format", {}).get("template", DEFAULT_SMS_FORMAT)
+            
+            help_text = """✏️ <b>Edit SMS Format</b>
+
+<b>Current Format:</b>
+<pre>{}</pre>
+
+<b>Available Variables:</b>
+• <code>{{otp}}</code> - The OTP code
+• <code>{{number}}</code> - Phone number
+• <code>{{message}}</code> - Full SMS message
+• <code>{{time}}</code> - Received time
+• <code>{{service}}</code> - Service name
+• <code>{{country}}</code> - Country
+
+<b>HTML Formatting:</b>
+• Use &lt;b&gt;bold&lt;/b&gt;
+• Use &lt;code&gt;monospace&lt;/code&gt;
+• Use &lt;i&gt;italic&lt;/i&gt;
+
+Send your new format now:""".format(html.escape(current_format[:500] + ("..." if len(current_format) > 500 else "")))
+            
+            await query.message.edit_text(
+                help_text,
+                parse_mode="HTML"
+            )
+        
+        # Button management - FIXED: Check ownership
+        elif data.startswith("buttons_"):
+            site_id = data.replace("buttons_", "")
+            site = get_site(site_id)
+            
+            # ✅ FIXED: Owner can manage all, admin only own sites
+            if not site or (not is_owner(user_id) and site["user_id"] != user_id):
+                await query.message.edit_text("❌ Access denied")
+                return
+            
+            buttons = site.get("buttons", DEFAULT_BUTTONS)
+            
+            # Create button management menu
+            keyboard = []
+            for i, btn in enumerate(buttons):
+                status = "✅" if btn.get("enabled", True) else "❌"
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{status} {btn.get('text', f'Button {i+1}')}",
+                        callback_data=f"editbtn_{site_id}_{i}"
+                    )
+                ])
+            
+            keyboard.append([
+                InlineKeyboardButton("➕ Add New Button", callback_data=f"addbtn_{site_id}"),
+                InlineKeyboardButton("🔙 Back", callback_data=f"view_site_{site_id}")
+            ])
+            
+            await query.message.edit_text(
+                f"🔘 <b>Button Management</b>\n\n"
+                f"Site: {html.escape(site.get('name', 'Unknown'))}\n\n"
+                f"<b>Current Buttons ({len(buttons)}):</b>\n"
+                f"Click on a button to edit it.\n\n"
+                f"<b>Note:</b> Max 4 buttons, 2 per row.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        
+        # Edit specific button - FIXED: Check ownership
+        elif data.startswith("editbtn_"):
+            parts = data.split("_")
+            if len(parts) >= 3:
+                site_id = parts[1]
+                btn_index = int(parts[2])
+                
+                site = get_site(site_id)
+                # ✅ FIXED: Owner can edit all, admin only own sites
+                if not site or (not is_owner(user_id) and site["user_id"] != user_id):
+                    await query.message.edit_text("❌ Access denied")
+                    return
+                
+                buttons = site.get("buttons", DEFAULT_BUTTONS)
+                if btn_index >= len(buttons):
+                    await query.message.edit_text("❌ Button not found")
+                    return
+                
+                btn = buttons[btn_index]
+                
+                # Button editor menu
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📝 Edit Text", callback_data=f"btntext_{site_id}_{btn_index}"),
+                        InlineKeyboardButton("🔗 Edit URL", callback_data=f"btnurl_{site_id}_{btn_index}")
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "✅ Enabled" if btn.get("enabled", True) else "❌ Disabled",
+                            callback_data=f"btntoggle_{site_id}_{btn_index}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton("🗑 Delete Button", callback_data=f"btndelete_{site_id}_{btn_index}"),
+                        InlineKeyboardButton("🔙 Back", callback_data=f"buttons_{site_id}")
+                    ]
+                ]
+                
+                await query.message.edit_text(
+                    f"🔧 <b>Edit Button</b>\n\n"
+                    f"<b>Text:</b> {btn.get('text', 'Not set')}\n"
+                    f"<b>URL:</b> {btn.get('url', 'Not set')}\n"
+                    f"<b>Status:</b> {'✅ Enabled' if btn.get('enabled', True) else '❌ Disabled'}\n\n"
+                    f"Select an action:",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+        
+        # Toggle button - FIXED: Check ownership
+        elif data.startswith("btntoggle_"):
+            parts = data.split("_")
+            if len(parts) >= 3:
+                site_id = parts[1]
+                btn_index = int(parts[2])
+                
+                site = get_site(site_id)
+                # ✅ FIXED: Owner can toggle all, admin only own sites
+                if not site or (not is_owner(user_id) and site["user_id"] != user_id):
+                    await query.message.edit_text("❌ Access denied")
+                    return
+                
+                buttons = site.get("buttons", DEFAULT_BUTTONS).copy()
+                if btn_index < len(buttons):
+                    buttons[btn_index]["enabled"] = not buttons[btn_index].get("enabled", True)
+                    update_site(site_id, {"buttons": buttons})
+                    
+                    # ✅ FIXED: Safe redirect instead of recursive callback
+                    await query.message.edit_text(
+                        "✅ Button status updated",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔙 Back", callback_data=f"buttons_{site_id}")]
+                        ])
+                    )
+        
+        # Edit button text - FIXED: Check ownership
+        elif data.startswith("btntext_"):
+            parts = data.split("_")
+            if len(parts) >= 3:
+                site_id = parts[1]
+                btn_index = int(parts[2])
+                
+                site = get_site(site_id)
+                # ✅ FIXED: Owner can edit all, admin only own sites
+                if not site or (not is_owner(user_id) and site["user_id"] != user_id):
+                    await query.message.edit_text("❌ Access denied")
+                    return
+                
+                context.user_data["edit_button_text"] = {
+                    "site_id": site_id,
+                    "btn_index": btn_index
+                }
+                
+                await query.message.edit_text(
+                    "📝 <b>Edit Button Text</b>\n\n"
+                    "Enter the new text for this button:\n\n"
+                    "Max length: 20 characters",
+                    parse_mode="HTML"
+                )
+        
+        # Edit button URL - FIXED: Check ownership
+        elif data.startswith("btnurl_"):
+            parts = data.split("_")
+            if len(parts) >= 3:
+                site_id = parts[1]
+                btn_index = int(parts[2])
+                
+                site = get_site(site_id)
+                # ✅ FIXED: Owner can edit all, admin only own sites
+                if not site or (not is_owner(user_id) and site["user_id"] != user_id):
+                    await query.message.edit_text("❌ Access denied")
+                    return
+                
+                context.user_data["edit_button_url"] = {
+                    "site_id": site_id,
+                    "btn_index": btn_index
+                }
+                
+                await query.message.edit_text(
+                    "🔗 <b>Edit Button URL</b>\n\n"
+                    "Enter the new URL for this button:\n\n"
+                    "Supported formats:\n"
+                    "• https://example.com\n"
+                    "• tg://resolve?domain=username\n"
+                    "• t.me/username",
+                    parse_mode="HTML"
+                )
+        
+        # Add new button - FIXED: Check ownership
+        elif data.startswith("addbtn_"):
+            site_id = data.replace("addbtn_", "")
+            site = get_site(site_id)
+            
+            # ✅ FIXED: Owner can add to all, admin only own sites
+            if not site or (not is_owner(user_id) and site["user_id"] != user_id):
+                await query.message.edit_text("❌ Access denied")
+                return
+            
+            buttons = site.get("buttons", DEFAULT_BUTTONS).copy()
+            
+            if len(buttons) >= 4:
+                await query.message.edit_text(
+                    "❌ <b>Maximum buttons reached</b>\n\n"
+                    "You can only have up to 4 buttons.\n"
+                    "Delete a button first to add new one.",
+                    parse_mode="HTML"
+                )
+                return
+            
+            # Add new button
+            buttons.append({
+                "text": "New Button",
+                "url": "https://example.com",
+                "enabled": True
+            })
+            
+            update_site(site_id, {"buttons": buttons})
+            
+            # Return to button management
+            await query.message.edit_text(
+                "✅ New button added",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data=f"buttons_{site_id}")]
+                ])
+            )
+        
+        # Delete button - FIXED: Check ownership
+        elif data.startswith("btndelete_"):
+            parts = data.split("_")
+            if len(parts) >= 3:
+                site_id = parts[1]
+                btn_index = int(parts[2])
+                
+                site = get_site(site_id)
+                # ✅ FIXED: Owner can delete from all, admin only own sites
+                if not site or (not is_owner(user_id) and site["user_id"] != user_id):
+                    await query.message.edit_text("❌ Access denied")
+                    return
+                
+                buttons = site.get("buttons", DEFAULT_BUTTONS).copy()
+                if btn_index < len(buttons):
+                    del buttons[btn_index]
+                    update_site(site_id, {"buttons": buttons})
+                    
+                    await query.message.edit_text(
+                        "✅ <b>Button Deleted</b>",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔙 Back", callback_data=f"buttons_{site_id}")]
+                        ])
+                    )
         
         # Help
         elif data == "help":
@@ -971,6 +1479,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Enter your PHPSESSID cookie
 • Use INTS SMS format URL
 
+<b>Step 5 - Customization:</b>
+• Edit SMS format per site
+• Edit inline buttons per site
+• Manage admins (owner only)
+
 <b>Support:</b> @botcasx"""
             
             await query.message.edit_text(
@@ -979,7 +1492,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=back_to_main_menu()
             )
         
-        # Statistics
+        # Statistics - FIXED: Uses get_user_sites which respects ownership
         elif data == "stats":
             sites = get_user_sites(user_id)
             
@@ -1017,14 +1530,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=back_to_main_menu()
             )
         
-        # Handle other callbacks
+        # Handle other callbacks - FIXED: Check ownership
         elif data.startswith("chats_") or data.startswith("cookies_") or data.startswith("headers_") or data.startswith("delete_") or data.startswith("token_") or data.startswith("site_stats_"):
             parts = data.split("_")
             if len(parts) >= 2:
                 site_id = parts[1]
                 site = get_site(site_id)
                 
-                if not site or site["user_id"] != user_id:
+                # ✅ FIXED: Owner can access all, admin only own sites
+                if not site or (not is_owner(user_id) and site["user_id"] != user_id):
                     await query.message.edit_text("❌ Access denied")
                     return
                 
@@ -1081,12 +1595,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= POLLER =================
 
 def poller_sync():
-    """Main polling loop - FIXED with all critical patches"""
+    """Main polling loop"""
     global LAST_RESET
     
     while True:
         try:
-            # ✅ FIX 4: Optimized daily reset - run only once per day
+            # Optimized daily reset
             now = datetime.utcnow()
             if not LAST_RESET or now.date() != LAST_RESET.date():
                 reset_daily_stats()
@@ -1103,7 +1617,7 @@ def poller_sync():
                         {"$set": {"last_check": datetime.utcnow()}}
                     )
                     
-                    # ✅ FIX 1: Reuse session instead of creating new one every loop
+                    # Reuse session
                     if site["_id"] not in SITE_SESSIONS:
                         SITE_SESSIONS[site["_id"]] = get_site_session(site)
                     
@@ -1121,7 +1635,7 @@ def poller_sync():
                             timeout=20
                         )
                         
-                        # ✅ FIX 2: Improved HTML detection
+                        # HTML detection
                         content_type = response.headers.get("Content-Type", "").lower()
                         response_text = response.text.lower()
                         
@@ -1131,7 +1645,7 @@ def poller_sync():
                                 {"_id": site["_id"]},
                                 {"$inc": {"stats.errors": 1}}
                             )
-                            # Clear session on HTML response (likely expired)
+                            # Clear session on HTML response
                             if site["_id"] in SITE_SESSIONS:
                                 del SITE_SESSIONS[site["_id"]]
                             continue
@@ -1196,30 +1710,28 @@ def poller_sync():
                         if otp == "N/A":
                             continue
                         
-                        # CRITICAL: Update last_uid BEFORE sending
+                        # Update last_uid BEFORE sending
                         sites_col.update_one(
                             {"_id": site["_id"]},
                             {"$set": {"last_uid": uid}}
                         )
                         
                         # Format message
-                        formatted_message = format_otp_message(
-                            otp=otp,
-                            number=number,
-                            message=message,
-                            date=date,
-                            site_name=site.get("name", "Unknown"),
-                            route=route_raw,
-                            service=service
-                        )
+                        formatted_message = render_sms(site, {
+                            "otp": otp,
+                            "number": number,
+                            "message": message,
+                            "date": date,
+                            "service": service,
+                            "country": route_raw.split("-")[0] if "-" in route_raw else route_raw
+                        })
                         
                         # Send to Telegram
                         success = send_to_telegram(
                             bot_token=site["bot_token"],
                             chat_ids=site.get("chat_ids", []),
                             text=formatted_message,
-                            owner_url=site.get("owner_url", ""),
-                            support_url=site.get("support_url", "t.me/botcasx")
+                            site=site
                         )
                         
                         if success:
@@ -1254,7 +1766,7 @@ def poller_sync():
                             timeout=15
                         )
                         
-                        # ✅ FIX 2: Improved HTML detection
+                        # HTML detection
                         content_type = response.headers.get("Content-Type", "").lower()
                         response_text = response.text.lower()
                         
@@ -1311,28 +1823,28 @@ def poller_sync():
                         if otp == "N/A":
                             continue
                         
-                        # CRITICAL: Update last_uid BEFORE sending
+                        # Update last_uid BEFORE sending
                         sites_col.update_one(
                             {"_id": site["_id"]},
                             {"$set": {"last_uid": row_id}}
                         )
                         
                         # Format message
-                        formatted_message = format_otp_message(
-                            otp=otp,
-                            number=phone_number,
-                            message=message,
-                            date=timestamp,
-                            site_name=site.get("name", "Unknown Service")
-                        )
+                        formatted_message = render_sms(site, {
+                            "otp": otp,
+                            "number": phone_number,
+                            "message": message,
+                            "date": timestamp,
+                            "service": site.get("name", "Unknown Service"),
+                            "country": get_country_from_number(phone_number)
+                        })
                         
                         # Send to Telegram
                         success = send_to_telegram(
                             bot_token=site["bot_token"],
                             chat_ids=site.get("chat_ids", []),
                             text=formatted_message,
-                            owner_url=site.get("owner_url", ""),
-                            support_url=site.get("support_url", "t.me/botcasx")
+                            site=site
                         )
                         
                         if success:
@@ -1380,16 +1892,20 @@ def start_poller_thread():
 # ================= MAIN =================
 
 def main():
-    """Main function - FIXED for Heroku"""
+    """Main function"""
     if not MASTER_BOT_TOKEN:
         print("❌ Error: MASTER_BOT_TOKEN not set!")
         print("Please set MASTER_BOT_TOKEN in environment variables")
         exit(1)
     
-    logging.info("Starting AK KING 👑 bot...")
+    if OWNER_ID == 0:
+        print("❌ Error: OWNER_ID not set in environment!")
+        print("Please set OWNER_ID in environment variables")
+        exit(1)
+    
+    logging.info(f"Starting AK KING 👑 bot for owner {OWNER_ID}...")
     
     try:
-        # Create application with proper settings
         app = ApplicationBuilder()\
             .token(MASTER_BOT_TOKEN)\
             .connection_pool_size(10)\
@@ -1403,7 +1919,12 @@ def main():
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("help", help_command))
         app.add_handler(CommandHandler("id", my_id))
-        app.add_handler(CommandHandler("cancel", lambda u, c: None))
+        
+        # Admin management commands
+        app.add_handler(CommandHandler("addadmin", add_admin))
+        app.add_handler(CommandHandler("removeadmin", remove_admin))
+        app.add_handler(CommandHandler("listadmins", list_admins))
+        app.add_handler(CommandHandler("access", check_access))
         
         # Add callback handler
         app.add_handler(CallbackQueryHandler(callback_handler))
