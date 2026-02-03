@@ -3,7 +3,6 @@
 # ASYNC MONGODB CONNECTION (MOTOR)
 # ============================================
 
-import asyncio
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
@@ -31,6 +30,7 @@ async def connect_mongo():
 
     try:
         logger.info("🔌 Connecting to MongoDB...")
+
         _client = AsyncIOMotorClient(
             MONGO_URI,
             maxPoolSize=50,
@@ -55,36 +55,34 @@ async def connect_mongo():
         raise SystemExit("MongoDB connection error")
 
 # ============================================
-# INDEX CREATION (MANDATORY)
+# 🔥 BACKWARD-COMPATIBLE ALIAS (CRITICAL FIX)
+# ============================================
+
+# main.py expects init_mongo()
+init_mongo = connect_mongo
+
+# ============================================
+# INDEX CREATION
 # ============================================
 
 async def _create_indexes():
-    """
-    Create required indexes for all collections.
-    """
     try:
         logger.info("⚙️ Creating MongoDB indexes...")
 
-        # USERS
         await _db.users.create_index("user_id", unique=True)
-
-        # ADMINS
         await _db.admins.create_index("user_id", unique=True)
 
-        # SITES
         await _db.sites.create_index("site_id", unique=True)
         await _db.sites.create_index("user_id")
         await _db.sites.create_index("enabled")
         await _db.sites.create_index("last_uid")
         await _db.sites.create_index([("user_id", 1), ("enabled", 1)])
 
-        # LOGS
         await _db.logs.create_index("timestamp")
         await _db.logs.create_index("level")
         await _db.logs.create_index("user_id")
         await _db.logs.create_index("site_id")
 
-        # SETTINGS
         await _db.settings.create_index("key", unique=True)
 
         logger.info("✅ MongoDB indexes created / verified")
@@ -98,12 +96,8 @@ async def _create_indexes():
 # ============================================
 
 def get_db():
-    """
-    Get database instance.
-    Ensures DB is initialized.
-    """
     if _db is None:
-        raise RuntimeError("MongoDB not initialized. Call connect_mongo() first.")
+        raise RuntimeError("MongoDB not initialized. Call init_mongo() first.")
     return _db
 
 # ============================================
@@ -111,9 +105,6 @@ def get_db():
 # ============================================
 
 async def close_mongo():
-    """
-    Gracefully close MongoDB connection.
-    """
     global _client
     try:
         if _client:
@@ -128,6 +119,7 @@ async def close_mongo():
 # ============================================
 
 __all__ = [
+    "init_mongo",
     "connect_mongo",
     "close_mongo",
     "get_db",
