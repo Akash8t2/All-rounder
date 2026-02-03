@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # ============================================================
-# SITES COLLECTION LOGIC (FULLY FIXED & EXTENDED)
+# SITES COLLECTION LOGIC (FULLY FIXED & PRODUCTION SAFE)
 # ============================================================
 # ✔ Async MongoDB (Motor)
-# ✔ Auto-detect AJAX metadata support
-# ✔ Per-site error buckets
-# ✔ Cookie expiry status tracking
+# ✔ Backward compatible (poller safe)
+# ✔ Auto-detect AJAX metadata
+# ✔ Per-site error analytics
+# ✔ Cookie expiry tracking
 # ✔ Dedup protection
-# ✔ Poller-safe atomic updates
-# ✔ NO missing logic
+# ✔ Atomic updates
+# ✔ ZERO missing imports / functions
 # ============================================================
 
 import logging
@@ -39,7 +40,7 @@ async def create_site(user_id: int, site_data: Dict) -> Optional[str]:
         site_id = str(int(time.time() * 1000))
 
         document = {
-            "_id": site_id,                 # 🔑 canonical ID
+            "_id": site_id,
             "site_id": site_id,
             "user_id": user_id,
 
@@ -55,7 +56,7 @@ async def create_site(user_id: int, site_data: Dict) -> Optional[str]:
             # Telegram
             "bot_token": site_data["bot_token"],
             "bot_username": site_data["bot_username"],
-            "chat_ids": site_data["chat_ids"],
+            "chat_ids": site_data.get("chat_ids", []),
 
             # HTTP
             "cookies": site_data.get("cookies", {}),
@@ -102,14 +103,14 @@ async def create_site(user_id: int, site_data: Dict) -> Optional[str]:
         }
 
         await _col().insert_one(document)
-        logger.info(f"✅ Site created | site_id={site_id} | user_id={user_id}")
+        logger.info(f"✅ Site created | site_id={site_id}")
         return site_id
 
     except DuplicateKeyError:
-        logger.warning("⚠️ Duplicate site_id generated")
+        logger.warning("⚠️ Duplicate site_id")
         return None
-    except PyMongoError as e:
-        logger.error("❌ Mongo error creating site", exc_info=True)
+    except PyMongoError:
+        logger.error("❌ create_site failed", exc_info=True)
         return None
 
 
@@ -127,9 +128,9 @@ async def get_site(site_id: str) -> Optional[Dict]:
 
 async def list_sites(user_id: Optional[int] = None) -> List[Dict]:
     try:
-        query = {} if user_id is None else {"user_id": user_id}
-        cursor = _col().find(query).sort("created_at", -1)
-        return [s async for s in cursor]
+        q = {} if user_id is None else {"user_id": user_id}
+        cur = _col().find(q).sort("created_at", -1)
+        return [s async for s in cur]
     except PyMongoError:
         logger.error("list_sites failed", exc_info=True)
         return []
@@ -137,8 +138,8 @@ async def list_sites(user_id: Optional[int] = None) -> List[Dict]:
 
 async def list_active_sites() -> List[Dict]:
     try:
-        cursor = _col().find({"enabled": True})
-        return [s async for s in cursor]
+        cur = _col().find({"enabled": True})
+        return [s async for s in cur]
     except PyMongoError:
         logger.error("list_active_sites failed", exc_info=True)
         return []
@@ -151,10 +152,7 @@ async def list_active_sites() -> List[Dict]:
 async def update_site(site_id: str, updates: Dict) -> bool:
     try:
         updates["updated_at"] = datetime.utcnow()
-        res = await _col().update_one(
-            {"_id": site_id},
-            {"$set": updates},
-        )
+        res = await _col().update_one({"_id": site_id}, {"$set": updates})
         return res.modified_count > 0
     except PyMongoError:
         logger.error("update_site failed", exc_info=True)
@@ -195,7 +193,7 @@ async def update_on_success(site_id: str, last_uid: str):
             {
                 "$set": {
                     "last_uid": last_uid,
-                    "last_success": datetime.utcnow(),
+                    "stats.last_success": datetime.utcnow(),
                     "cookie_status": "valid",
                     "cookie_status_updated": datetime.utcnow(),
                 },
@@ -210,7 +208,7 @@ async def update_on_success(site_id: str, last_uid: str):
 
 
 # ============================================================
-# AJAX META (AUTO-DETECT)
+# AJAX META
 # ============================================================
 
 async def update_ajax_meta(site_id: str, ajax_type: str, columns: int):
@@ -246,8 +244,7 @@ async def increment_error(site_id: str, error_type: str):
                 "$set": {
                     "last_error": {
                         "type": error_type,
-                        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                        "message": error_type,
+                        "time": datetime.utcnow(),
                     }
                 },
             },
@@ -288,15 +285,44 @@ async def update_cookie_status(site_id: str, status: str):
 
 
 # ============================================================
-# FINAL VERIFICATION CHECKLIST
+# 🔥 BACKWARD-COMPATIBLE ALIASES (CRITICAL)
 # ============================================================
-# - [x] CRUD complete
-# - [x] Async-safe (Motor)
-# - [x] Auto-detect AJAX metadata
-# - [x] Error buckets per site
-# - [x] Cookie expiry tracking
-# - [x] Dedup protection (last_uid)
-# - [x] Poller-safe atomic updates
-# - [x] Logging + error handling
-# - [x] No missing logic
+
+# poller.py expects OLD names
+get_enabled_sites = list_active_sites
+get_site_by_id = get_site
+update_site_last_check = update_last_check
+update_site_on_success = update_on_success
+increment_site_error = increment_error
+update_site_ajax_meta = update_ajax_meta
+update_site_cookie_status = update_cookie_status
+
+
 # ============================================================
+# EXPORTS
+# ============================================================
+
+__all__ = [
+    "create_site",
+    "get_site",
+    "list_sites",
+    "list_active_sites",
+    "update_site",
+    "toggle_site",
+    "delete_site",
+    "update_last_check",
+    "update_on_success",
+    "update_ajax_meta",
+    "increment_error",
+    "get_error_report",
+    "update_cookie_status",
+
+    # aliases
+    "get_enabled_sites",
+    "get_site_by_id",
+    "update_site_last_check",
+    "update_site_on_success",
+    "increment_site_error",
+    "update_site_ajax_meta",
+    "update_site_cookie_status",
+]
