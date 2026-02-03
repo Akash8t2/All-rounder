@@ -11,7 +11,11 @@ import sys
 from typing import Optional
 
 from pyrogram import Client
-from pyrogram.idle import idle
+# Pyrogram v2.0+ compatible idle import
+try:
+    from pyrogram import idle  # For Pyrogram v2.0+
+except ImportError:
+    from pyrogram.idle import idle  # For older Pyrogram
 
 from config.settings import (
     API_ID,
@@ -58,45 +62,31 @@ app = Client(
     api_hash=API_HASH,
     bot_token=MASTER_BOT_TOKEN,
     in_memory=True,   # Heroku safe
-    workers=4,        # Optimal for Heroku
-    sleep_threshold=60,  # For Heroku's 30-second timeout
+    workers=2,        # Reduced for Heroku free tier
 )
 
 # ============================================
-# HEROKU HEALTH CHECK SERVER
+# SIMPLE HEROKU PING SERVER
 # ============================================
 
-async def start_health_server():
-    """
-    Start a simple HTTP server for Heroku health checks
-    Required for web dyno to stay alive
-    """
-    try:
-        from aiohttp import web
+async def keep_alive_ping():
+    """Simple ping to keep Heroku dyno alive"""
+    import aiohttp
+    
+    # Ping every 5 minutes
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Ping your own app or external service
+                heroku_app_name = os.environ.get("HEROKU_APP_NAME")
+                if heroku_app_name:
+                    url = f"https://{heroku_app_name}.herokuapp.com"
+                    async with session.get(url, timeout=10):
+                        logger.debug("Ping sent to keep dyno alive")
+        except Exception as e:
+            logger.debug(f"Ping failed: {e}")
         
-        async def health_check(request):
-            return web.Response(text="Bot is running")
-        
-        app_web = web.Application()
-        app_web.router.add_get('/', health_check)
-        app_web.router.add_get('/health', health_check)
-        
-        # Heroku provides PORT environment variable
-        port = int(os.environ.get("PORT", 8080))
-        
-        runner = web.AppRunner(app_web)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        
-        logger.info(f"🌐 Health check server running on port {port}")
-        return runner
-    except ImportError:
-        logger.warning("aiohttp not installed, skipping health server")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to start health server: {e}")
-        return None
+        await asyncio.sleep(300)  # 5 minutes
 
 # ============================================
 # STARTUP LOGIC
@@ -110,13 +100,13 @@ async def startup():
     
     # Check Heroku environment
     if os.environ.get("DYNO"):
-        logger.info("🏗️ Running on Heroku dyno")
+        logger.info(f"🏗️ Running on Heroku dyno: {os.environ.get('DYNO')}")
     
     # MongoDB
     await init_mongo()
     logger.info("✅ MongoDB connected")
     
-    # Poller
+    # Start poller
     global poller_task
     poller_task = asyncio.create_task(
         poller_loop(),
@@ -124,10 +114,9 @@ async def startup():
     )
     logger.info("🔄 Poller task started")
     
-    # Start health server for web dyno
-    if os.environ.get("PORT"):
-        return await start_health_server()
-    return None
+    # Start keep-alive ping for worker dyno
+    if os.environ.get("DYNO"):
+        asyncio.create_task(keep_alive_ping(), name="keep_alive")
 
 # ============================================
 # SHUTDOWN LOGIC (SAFE & SINGLE LOOP)
@@ -157,7 +146,10 @@ async def shutdown():
     
     # Stop Pyrogram
     logger.info("🛑 Stopping Pyrogram client...")
-    await app.stop()
+    try:
+        await app.stop()
+    except Exception as e:
+        logger.error(f"Error stopping app: {e}")
     
     logger.info("✅ Shutdown complete")
 
@@ -165,33 +157,28 @@ async def shutdown():
 # SIGNAL HANDLING (SAME EVENT LOOP)
 # ============================================
 
-def install_signal_handlers(loop: asyncio.AbstractEventLoop):
+def install_signal_handlers():
     """
     Install SIGTERM / SIGINT handlers safely.
     """
-    def handle_signal():
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, initiating shutdown...")
         asyncio.create_task(shutdown())
     
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, handle_signal)
-        except (NotImplementedError, RuntimeError):
-            # Some platforms don't support add_signal_handler
-            signal.signal(sig, lambda s, f: loop.call_soon_threadsafe(handle_signal))
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
 
 # ============================================
 # MAIN ASYNC FUNCTION - HEROKU ADAPTED
 # ============================================
 
 async def main():
-    health_runner = None
     try:
-        # Startup services including health server
-        health_runner = await startup()
+        # Install signal handlers
+        install_signal_handlers()
         
-        # Install signal handlers on current loop
-        loop = asyncio.get_running_loop()
-        install_signal_handlers(loop)
+        # Startup services
+        await startup()
         
         # Start Pyrogram
         await app.start()
@@ -201,27 +188,21 @@ async def main():
         me = await app.get_me()
         logger.info(f"✅ Bot @{me.username} is ready!")
         
-        # Heroku-compatible idle - use asyncio.sleep instead of idle()
-        # This prevents Heroku from thinking the app crashed
-        logger.info("⏳ Bot is now running...")
+        # Heroku-compatible - use idle or wait
+        logger.info("⏳ Bot is now running on Heroku...")
         
-        # Keep the bot alive
-        while True:
-            await asyncio.sleep(86400)  # Sleep for 1 day
+        # For Heroku worker dyno, we need to keep running
+        # idle() will keep the bot running until stopped
+        await idle()
         
     except asyncio.CancelledError:
         logger.info("Main task cancelled (normal shutdown)")
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received")
     except Exception as e:
         logger.critical(f"Fatal error in main loop: {e}", exc_info=True)
+        raise
     finally:
-        # Cleanup health server if running
-        if health_runner:
-            try:
-                await health_runner.cleanup()
-                logger.info("✅ Health server stopped")
-            except Exception as e:
-                logger.error(f"Error stopping health server: {e}")
-        
         await shutdown()
 
 # ============================================
@@ -231,13 +212,18 @@ async def main():
 if __name__ == "__main__":
     # Heroku-friendly entry point
     try:
-        # Set event loop policy for Heroku
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        else:
-            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+        # Check for required environment variables
+        required_vars = ["API_ID", "API_HASH", "MASTER_BOT_TOKEN"]
+        missing_vars = [var for var in required_vars if not os.environ.get(var)]
         
+        if missing_vars:
+            logger.error(f"Missing environment variables: {missing_vars}")
+            logger.error("Please set these in Heroku config vars")
+            sys.exit(1)
+        
+        # Run the bot
         asyncio.run(main())
+        
     except KeyboardInterrupt:
         logger.warning("Process interrupted by user")
     except SystemExit:
