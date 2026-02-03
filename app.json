@@ -1,0 +1,61 @@
+{
+  "name": "OTP Master Bot - All-rounder",
+  "description": "Production-grade Telegram OTP Forwarder Bot built with Python (Pyrogram) and MongoDB. Supports auto-detect AJAX type, cookie expiry alerts, per-site error analytics, and custom Telegram formatting.",
+  "repository": "https://github.com/Akash8t2/All-rounder",
+  "logo": "https://telegram.org/img/t_logo.png",
+  "keywords": [
+    "python",
+    "telegram",
+    "pyrogram",
+    "otp",
+    "ajax",
+    "mongodb",
+    "heroku",
+    "sms",
+    "poller"
+  ],
+  "stack": "heroku-22",
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "env": {
+    "API_ID": {
+      "description": "Telegram API ID from https://my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Telegram API HASH from https://my.telegram.org",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "Main Telegram Bot Token from @BotFather",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Numeric Telegram User ID of the bot owner",
+      "required": true
+    },
+    "MONGO_URI": {
+      "description": "MongoDB connection string (MongoDB Atlas or self-hosted)",
+      "required": true
+    },
+    "CHECK_INTERVAL": {
+      "description": "AJAX poll interval in seconds (minimum 7 recommended)",
+      "value": "10",
+      "required": false
+    },
+    "TZ": {
+      "description": "Timezone for the app (recommended: UTC)",
+      "value": "UTC",
+      "required": false
+    }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  }
+}
