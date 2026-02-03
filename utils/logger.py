@@ -1,67 +1,82 @@
 #!/usr/bin/env python3
 # ============================================
-# CENTRALIZED LOGGER + DB LOG BRIDGE
+# CENTRALIZED LOGGER + DB LOG BRIDGE (FIXED)
+# ============================================
+# FIX APPLIED:
+# - setup_logging() function ADDED
+# - Compatible with main.py import
+# - Python logging + Loguru bridge preserved
+# - Heroku stdout safe
 # ============================================
 
 import sys
 import logging
-from loguru import logger as _loguru_logger
 from typing import Optional, Dict, Any
 
+from loguru import logger as _loguru_logger
 from database.logs import add_log
 
 # ============================================
-# LOGURU CONFIGURATION
+# SETUP FUNCTION (🔥 MISSING FIX)
 # ============================================
 
-# Remove default handler
-_loguru_logger.remove()
-
-# Console handler (Heroku compatible)
-_loguru_logger.add(
-    sys.stdout,
-    level="INFO",
-    format=(
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level}</level> | "
-        "<cyan>{name}</cyan> | "
-        "<level>{message}</level>"
-    ),
-    enqueue=True,
-    backtrace=True,
-    diagnose=True,
-)
-
-# ============================================
-# PYTHON LOGGING → LOGURU BRIDGE
-# ============================================
-
-class InterceptHandler(logging.Handler):
+def setup_logging() -> None:
     """
-    Redirect standard logging records to loguru.
+    Initialize global logging configuration.
+    Must be called ONCE at startup.
     """
+    try:
+        # Remove default loguru handlers
+        _loguru_logger.remove()
 
-    def emit(self, record: logging.LogRecord):
-        try:
-            level = _loguru_logger.level(record.levelname).name
-        except Exception:
-            level = record.levelno
+        # Console handler (Heroku compatible)
+        _loguru_logger.add(
+            sys.stdout,
+            level="INFO",
+            format=(
+                "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+                "<level>{level}</level> | "
+                "<cyan>{name}</cyan> | "
+                "<level>{message}</level>"
+            ),
+            enqueue=True,
+            backtrace=True,
+            diagnose=True,
+        )
 
-        frame, depth = logging.currentframe(), 2
-        while frame and frame.f_code.co_filename == logging.__file__:
-            frame = frame.f_back
-            depth += 1
+        # Bridge std logging → loguru
+        class InterceptHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord):
+                try:
+                    level = _loguru_logger.level(record.levelname).name
+                except Exception:
+                    level = record.levelno
 
-        _loguru_logger.opt(
-            depth=depth,
-            exception=record.exc_info,
-        ).log(level, record.getMessage())
+                frame, depth = logging.currentframe(), 2
+                while frame and frame.f_code.co_filename == logging.__file__:
+                    frame = frame.f_back
+                    depth += 1
 
-# Apply intercept globally
-logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO)
+                _loguru_logger.opt(
+                    depth=depth,
+                    exception=record.exc_info,
+                ).log(level, record.getMessage())
+
+        logging.basicConfig(
+            handlers=[InterceptHandler()],
+            level=logging.INFO,
+            force=True,
+        )
+
+        _loguru_logger.info("✅ Logging system initialized")
+
+    except Exception as e:
+        print("❌ Failed to initialize logging:", e)
+        raise
+
 
 # ============================================
-# HIGH-LEVEL LOG HELPERS (DB + CONSOLE)
+# HIGH-LEVEL ASYNC LOG HELPERS
 # ============================================
 
 async def log_info(
@@ -79,6 +94,7 @@ async def log_info(
         meta=meta,
     )
 
+
 async def log_warning(
     message: str,
     user_id: Optional[int] = None,
@@ -93,6 +109,7 @@ async def log_warning(
         site_id=site_id,
         meta=meta,
     )
+
 
 async def log_error(
     message: str,
@@ -109,6 +126,7 @@ async def log_error(
         meta=meta,
     )
 
+
 async def log_admin(
     message: str,
     admin_id: int,
@@ -122,6 +140,7 @@ async def log_admin(
         meta=meta,
     )
 
+
 async def log_user(
     message: str,
     user_id: int,
@@ -134,6 +153,7 @@ async def log_user(
         user_id=user_id,
         meta=meta,
     )
+
 
 async def log_system(
     message: str,
@@ -149,11 +169,10 @@ async def log_system(
 # ============================================
 # FINAL VERIFICATION CHECKLIST
 # ============================================
-# - [x] Centralized logging implemented
-# - [x] Console + MongoDB logging
-# - [x] Admin / User / System separation
-# - [x] Error handling added
-# - [x] Heroku compatible (stdout)
-# - [x] Async-safe
-# - [x] No placeholder
-# - [x] No skipped logic
+# - [x] setup_logging() implemented
+# - [x] main.py import fixed
+# - [x] Loguru + logging bridge intact
+# - [x] MongoDB logging preserved
+# - [x] Heroku stdout compatible
+# - [x] No missing logic
+# - [x] No placeholders
