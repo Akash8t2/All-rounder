@@ -18,6 +18,8 @@ load_dotenv()
 MASTER_BOT_TOKEN = os.getenv("MASTER_BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 OWNER_ID = os.getenv("OWNER_ID")
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
 
 # Optional / Tunables
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))  # seconds
