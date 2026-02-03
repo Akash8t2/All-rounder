@@ -20,6 +20,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 OWNER_ID = os.getenv("OWNER_ID")
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
+APP_NAME = os.getenv("APP_NAME")
 
 # Optional / Tunables
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))  # seconds
