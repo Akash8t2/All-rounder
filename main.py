@@ -25,14 +25,14 @@ from services.poller import poller_loop
 
 # ============================================
 # IMPORT HANDLER MODULES
-# (they expose register(app))
+# (They auto-register via decorators)
 # ============================================
 
-import handlers.start
-import handlers.admin
-import handlers.sites
-import handlers.callbacks
-import handlers.messages
+import handlers.start        # noqa: F401
+import handlers.admin        # noqa: F401
+import handlers.sites        # noqa: F401
+import handlers.callbacks    # noqa: F401
+import handlers.messages     # noqa: F401
 
 # ============================================
 # LOGGING SETUP
@@ -82,15 +82,11 @@ async def startup():
 
     # Create client
     app_instance = create_client()
+    logger.info("✅ Pyrogram client created")
 
-    # 🔥 REGISTER HANDLERS ON THIS CLIENT
-    handlers.start.register(app_instance)
-    handlers.admin.register(app_instance)
-    handlers.sites.register(app_instance)
-    handlers.callbacks.register(app_instance)
-    handlers.messages.register(app_instance)
-
-    logger.info("✅ Handlers registered")
+    # Note: Handlers are automatically registered via decorators
+    # when we imported the handler modules above
+    logger.info("✅ Handlers imported and ready")
 
     # Start poller
     poller_task = asyncio.create_task(
