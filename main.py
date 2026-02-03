@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================
-# MAIN ENTRY POINT (HEROKU + PYROGRAM SAFE)
+# MAIN ENTRY POINT (PYROGRAM • HEROKU • SAFE)
 # ============================================
 
 import asyncio
@@ -39,9 +39,8 @@ logger = logging.getLogger("__main__")
 # GLOBAL STATE
 # ============================================
 
-_shutdown_event = asyncio.Event()
-_shutdown_started = False
-_poller_task: Optional[asyncio.Task] = None
+shutdown_event = asyncio.Event()
+poller_task: Optional[asyncio.Task] = None
 
 # ============================================
 # PYROGRAM CLIENT
@@ -61,59 +60,40 @@ app = Client(
 # ============================================
 
 async def startup():
-    if _shutdown_event.is_set():
-        logger.warning("Startup skipped due to shutdown")
-        return
-
     logger.info("🚀 Starting AK KING 👑 Bot")
 
     await init_mongo()
     logger.info("✅ MongoDB connected")
 
-    global _poller_task
-    if not _shutdown_event.is_set():
-        _poller_task = asyncio.create_task(poller_loop(), name="poller")
-        logger.info("🔄 Poller task started")
+    global poller_task
+    poller_task = asyncio.create_task(poller_loop(), name="poller")
+    logger.info("🔄 Poller task started")
 
 # ============================================
-# SHUTDOWN (CRITICAL FIX)
+# SHUTDOWN (FIXED)
 # ============================================
 
 async def shutdown():
-    global _shutdown_started
-
-    if _shutdown_started:
-        return
-
-    _shutdown_started = True
     logger.warning("🛑 Shutdown initiated")
 
-    # Stop Pyrogram FIRST
-    if app.is_connected:
-        logger.info("🛑 Stopping Pyrogram client...")
-        await app.stop()
-
-    # Stop poller
-    global _poller_task
-    if _poller_task and not _poller_task.done():
-        _poller_task.cancel()
+    if poller_task and not poller_task.done():
+        poller_task.cancel()
         try:
-            await _poller_task
+            await poller_task
         except asyncio.CancelledError:
-            logger.info("Poller loop cancelled gracefully")
+            logger.warning("Poller loop cancelled gracefully")
 
-    _shutdown_event.set()
-    logger.info("✅ Shutdown complete")
+    shutdown_event.set()
+    logger.info("✅ Shutdown signal set")
 
 # ============================================
-# SIGNAL HANDLING (HEROKU SAFE)
+# SIGNAL HANDLING (SAFE)
 # ============================================
 
 def _handle_signal(sig, frame):
-    logger.warning(f"Received signal {sig}, shutting down...")
-    loop = asyncio.get_event_loop()
-    if not _shutdown_event.is_set():
-        loop.create_task(shutdown())
+    logger.warning(f"📴 Received signal {sig}, initiating shutdown")
+    if not shutdown_event.is_set():
+        shutdown_event.set()
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
@@ -126,12 +106,9 @@ async def main():
     try:
         await startup()
 
-        if _shutdown_event.is_set():
-            return
-
         async with app:
             logger.info("🤖 Pyrogram client started")
-            await _shutdown_event.wait()
+            await shutdown_event.wait()
 
     except Exception:
         logger.critical("Fatal error in main loop", exc_info=True)
